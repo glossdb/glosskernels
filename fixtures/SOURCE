@@ -1,0 +1,5 @@
+The pinned oracle fixtures the parity tests read, copied from the port
+repo (glossdb/tabicl-candle, verify/experiments/fixtures) at commit
+2b5481a88f4f896faa9e35ae6586871a6034d3ae, generated there with tabicl 2.1.1 on
+CPU by verify/python/gen_bands_oracle.py, gen_e4_ensemble_oracle.py and
+gen_density_fixtures.py. Regenerate there, then copy.
