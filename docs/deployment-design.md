@@ -280,3 +280,6 @@ entity scoring · synthetic twins.
 - [x] `/misfit` per column (`columns: true`): the conditionals the score sums, returned unsummed;
       `folds` to score rows from a context they are not in.
 - [ ] glossql moves to this API.
+- [ ] After the move: the forecast door in glossql — a declared forecast, its
+      future months and its backtest (`docs/forecast-door.md`). Shapes side by
+      side waits for load.
