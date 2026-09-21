@@ -65,3 +65,57 @@ def test_panel_axis():
     panel = panels.synthetic(series=3, months=14)
     assert panel.moy.tolist() == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 1, 2]
     assert panel.head(2).y.shape == (2, 14) and panel.head(9) is panel
+
+
+def test_recipe_further_out_reads_only_what_was_known():
+    v = np.arange(1.0, 15.0)
+    moy = np.arange(17) % 12 + 1
+    feats, labels = voices.recipe(v, moy, h=3)
+    assert feats.shape == (14, 5) and labels.tolist() == v[3:].tolist()
+    # Month 3, called from month 0: the lag and the mean are month 0's value.
+    assert feats[0, :4].tolist() == [3.0, 4.0, 1.0, 1.0]
+    # Month 16, the one to call: last known is month 13, a year back is month 4.
+    assert feats[-1].tolist() == [16.0, 5.0, 14.0, 13.0, 5.0]
+    # Past a year out the 12-month lag is not yet known.
+    assert np.isnan(voices.recipe(v, np.arange(27) % 12 + 1, h=13)[0][:, 4]).all()
+
+
+def test_trailing_sum():
+    y = np.array([[1.0, 2.0, 3.0, 4.0, 5.0], [np.nan, 1.0, 1.0, np.nan, 1.0]])
+    got = score.trailing_sum(y, 3)
+    assert np.isnan(got[0, :2]).all() and got[0, 2:].tolist() == [6.0, 9.0, 12.0]
+    assert np.isnan(got[1]).tolist() == [True, True, True, True, True]
+
+
+class _Narrow:
+    """A voice that knows the centre and claims seven tenths of the
+    spread — narrow, and still inside what the percentile grid can mend
+    (at half, the 80 band's ends lie past the first percentile)."""
+
+    name = "narrow"
+
+    def step(self, y, moy, alphas, h=1):
+        from scipy.stats import norm
+
+        return np.tile(100.0 + 0.7 * norm.ppf(alphas), (y.shape[0], 1))
+
+
+def test_calibrated_voice_widens_to_its_record():
+    rng = np.random.default_rng(3)
+    start = np.datetime64("2015-01", "M")
+    months = np.arange(start, start + np.timedelta64(40, "M"), dtype="datetime64[M]")
+    panel = panels.Panel("noise", months, 100.0 + rng.normal(size=(80, 40)))
+    raw = voices._Once(_Narrow())
+    out = score.walk(panel, [raw, voices.Calibrated(raw)], months=10, burn=10)
+    assert out["voices"]["narrow"]["coverage80"] < 0.7
+    assert abs(out["voices"]["cal:narrow"]["coverage80"] - 0.8) < 0.04
+    # The tails past the grid's ends stay narrow, so the PITs mend most of the way, not all.
+    assert out["voices"]["cal:narrow"]["pit_ks"] < 0.7 * out["voices"]["narrow"]["pit_ks"]
+
+
+def test_projection_scores_months_and_totals():
+    out = score.project(panels.synthetic(series=6, months=60), [voices.SeasonalNaive()], origins=2)
+    v = out["voices"]["seasonal_naive"]
+    assert {"h1", "h3", "h6", "h12", "total_summed", "total_direct"} <= set(v)
+    # Monthly bands added up claim every month misses together: wider than the total called directly.
+    assert v["total_summed"]["width80"] > v["total_direct"]["width80"]
