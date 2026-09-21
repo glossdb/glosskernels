@@ -23,7 +23,11 @@ class Fake:
                 continue
             n = read.test_x.shape[0]
             kept = read.context or ("kept-for-" + read.caller if read.cache else None)
-            out.append((np.tile(np.asarray(levels) + members, (n, 1)), np.tile(np.arange(1.0, 10.0), (n, 1)), kept))
+            spoken = {"tabicl": (np.tile(np.asarray(levels) + members, (n, 1)), np.tile(np.arange(1.0, 10.0), (n, 1)))}
+            for at, name in enumerate(read.voices[1:], start=1):  # each further voice 10 higher than the last
+                q = np.tile(np.asarray(levels) + members + 10.0 * at, (n, 1))
+                spoken[name] = (q, q)
+            out.append(kernels.Answered(spoken, kept))
         return out
 
     def misfit(self, x):
@@ -144,3 +148,44 @@ def test_a_kept_context_is_named_and_read_by_its_id(client):
     assert r.status_code == 404 and "context_unknown" in r.json()["error"]
     r = client.post("/bands", json={"alphas": [0.5], "reads": [READ | {"context": "x"}]})
     assert r.status_code == 400 and "in place of" in r.json()["error"]
+
+
+def test_voices_answer_on_their_own_beside_their_blend(client):
+    body = {
+        "alphas": [0.1, 0.9],
+        "voices": ["tabicl", "chronos2", "seasonal_naive"],
+        "reads": [READ | {"history": [1, 2, 3, 4, 5, 6, 7, 8], "actual": [1.505, None]}],
+    }
+    r = client.post("/bands", json=body)
+    assert r.status_code == 200, r.text
+    (read,) = r.json()["reads"]
+    assert set(read) == {"voices", "blend"} and set(read["voices"]) == {"tabicl", "chronos2", "seasonal_naive"}
+    assert read["voices"]["tabicl"]["quantiles"] == [[1.1, 1.9]] * 2
+    assert read["voices"]["chronos2"]["quantiles"] == [[11.1, 11.9]] * 2
+    assert read["blend"]["quantiles"] == [[11.1, 11.9]] * 2  # the mean of 1.x, 11.x and 21.x
+    # Each voice's PIT is read off its own percentiles: 1.505 sits just over tabicl's median, under the others' floors.
+    assert read["voices"]["tabicl"]["pit"] == [0.5, None] and read["voices"]["chronos2"]["pit"] == [0.0, None]
+
+
+def test_voices_are_read_through_their_own_records(client):
+    body = {
+        "alphas": [0.5],
+        "voices": ["tabicl", "chronos2"],
+        "reads": [READ | {"history": [1, 2, 3, 4, 5, 6, 7, 8], "horizon": [3, 3]}],
+        "pit_history": {"chronos2": [0] * 99 + [5000]},  # its actuals always landed at the very top
+    }
+    (read,) = client.post("/bands", json=body).json()["reads"]
+    assert "raw" not in read["voices"]["tabicl"] and read["voices"]["chronos2"]["raw"] == [[11.5]] * 2
+    assert read["voices"]["chronos2"]["quantiles"][0][0] > 11.98
+
+
+def test_voices_refusals(client):
+    base = {"alphas": [0.5], "reads": [READ | {"history": [1, 2, 3]}]}
+    r = client.post("/bands", json=base | {"voices": ["chronos2"]})
+    assert r.status_code == 400 and "tabicl" in r.json()["error"]
+    r = client.post("/bands", json={"alphas": [0.5], "voices": ["tabicl", "chronos2"], "reads": [READ]})
+    assert r.status_code == 400 and "history" in r.json()["error"]
+    r = client.post("/bands", json=base | {"voices": ["tabicl", "chronos2"], "pit_history": [0] * 100})
+    assert r.status_code == 400 and "by voice" in r.json()["error"]
+    r = client.post("/bands", json={"alphas": [0.5], "voices": ["tabicl", "chronos2"], "reads": [READ | {"history": [1, 2, 3], "horizon": [0, 1]}]})
+    assert r.status_code == 400 and "horizon" in r.json()["error"]

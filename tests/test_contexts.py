@@ -28,11 +28,12 @@ def test_a_kept_context_answers_as_the_rows_do(k, panel, members):
     x, y, q = panel
     (rows,) = k.answer([Read(q, x, y)], [ALPHAS], members)
     (kept,) = k.answer([Read(q, x, y, cache=True, caller="a")], [ALPHAS], members)
-    assert rows[2] is None and isinstance(kept[2], str)
-    assert np.allclose(kept[0], rows[0], rtol=2e-3, atol=2e-3) and kept[1].shape == rows[1].shape
+    assert rows.context is None and isinstance(kept.context, str)
+    (rows_q, rows_grid), (kept_q, kept_grid) = rows.voices["tabicl"], kept.voices["tabicl"]
+    assert np.allclose(kept_q, rows_q, rtol=2e-3, atol=2e-3) and kept_grid.shape == rows_grid.shape
     # By its id, other query rows and other levels, without the rows.
-    (again,) = k.answer([Read(q[:2], context=kept[2], caller="a")], [[0.5]], members)
-    assert np.allclose(again[0][:, 0], rows[0][:2, 1], rtol=2e-3, atol=2e-3)
+    (again,) = k.answer([Read(q[:2], context=kept.context, caller="a")], [[0.5]], members)
+    assert np.allclose(again.voices["tabicl"][0][:, 0], rows_q[:2, 1], rtol=2e-3, atol=2e-3)
     # The same rows again find it rather than build it.
     builds = k.contexts.stats["builds"]
     k.answer([Read(q, x, y, cache=True, caller="a")], [ALPHAS], members)
@@ -42,10 +43,12 @@ def test_a_kept_context_answers_as_the_rows_do(k, panel, members):
 def test_a_context_is_its_callers_alone(k, panel):
     x, y, q = panel
     (kept,) = k.answer([Read(q, x, y, cache=True, caller="a")], [ALPHAS], 1)
-    (other,) = k.answer([Read(q, context=kept[2], caller="b")], [ALPHAS], 1)
+    (other,) = k.answer([Read(q, context=kept.context, caller="b")], [ALPHAS], 1)
     assert isinstance(other, ContextUnknown) and "send the rows again" in str(other)
     # And refusing one read leaves the cycle's others answered.
-    good, bad = k.answer([Read(q, context=kept[2], caller="a"), Read(q[:, :2], context=kept[2], caller="a")], [ALPHAS] * 2, 1)
+    good, bad = k.answer(
+        [Read(q, context=kept.context, caller="a"), Read(q[:, :2], context=kept.context, caller="a")], [ALPHAS] * 2, 1
+    )
     assert not isinstance(good, Exception) and "features" in str(bad)
 
 

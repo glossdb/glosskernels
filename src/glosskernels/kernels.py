@@ -32,6 +32,7 @@ import torch
 from huggingface_hub import hf_hub_download
 from tabicl import TabICLRegressor, TabICLUnsupervised
 
+from . import voices
 from .contexts import Contexts, ContextUnknown, Held, budget_bytes, context_id
 from .prepare import prepare_many, warm
 
@@ -68,11 +69,27 @@ class Read:
     context: str | None = None  # in place of the rows
     cache: bool = False  # keep this read's context for later reads
     caller: str = "open"
+    # For the voices that read a series: the series up to the origin, how
+    # many months past it each query row lies, and its season's length.
+    voices: tuple[str, ...] = ("tabicl",)
+    history: np.ndarray | None = None
+    horizon: np.ndarray | None = None
+    season: int = 12
+
+
+@dataclass
+class Answered:
+    """A read's answer: per voice (quantiles at the levels asked, the grid
+    its PIT is read from), and the id of its context where one is kept."""
+
+    voices: dict[str, tuple[np.ndarray, np.ndarray]]
+    context: str | None = None
 
 
 def fetch_checkpoints() -> None:
-    """Pull the regressor into the hub cache — the image bakes it."""
+    """Pull the regressor and Chronos-2 into the hub cache — the image bakes them."""
     hf_hub_download(repo_id=HUB_REPO, filename=REGRESSOR)
+    voices.fetch_checkpoints()
 
 
 def pick_device() -> str:
@@ -152,6 +169,7 @@ class Kernels:
         loader.model_.to(loader.device_)
         self.model = loader.model_
         self.contexts = Contexts(budget_bytes(self.device))
+        self.chronos = voices.Chronos2(self.device)  # loads on first use
 
     def _regressor(self, **kwargs: Any) -> _Regressor:
         kwargs.setdefault("use_amp", self.use_amp)
@@ -161,11 +179,8 @@ class Kernels:
 
     # -- the reads --------------------------------------------------------
 
-    def answer(
-        self, reads: list[Read], alphas: list[list[float]], members: int = 1
-    ) -> list[tuple[np.ndarray, np.ndarray, str | None] | Exception]:
-        """Every read of a cycle, each answered as (quantiles, raw grid,
-        context id or None) or with its refusal in place. Reads that
+    def answer(self, reads: list[Read], alphas: list[list[float]], members: int = 1) -> list[Answered | Exception]:
+        """Every read of a cycle, each `Answered` or with its refusal in place. Reads that
         bring their rows and keep nothing ride the forward passes
         together; a read against a kept context costs only its query
         rows; a read asking to be kept builds its context once (the
@@ -180,7 +195,7 @@ class Kernels:
                 refusals=True,
             )
             for i, got in zip(plain, served):
-                out[i] = got if isinstance(got, Exception) else (got[0], got[1], None)
+                out[i] = got if isinstance(got, Exception) else Answered({"tabicl": (got[0], got[1])})
         for i, read in enumerate(reads):
             if out[i] is not None:
                 continue
@@ -191,16 +206,56 @@ class Kernels:
                     raise KernelError(f"bands: test rows of shape {read.test_x.shape} against a context of {held.cols} features")
                 got = held.fitted.predict(read.test_x, output_type=["quantiles", "raw_quantiles"], alphas=list(alphas[i]))
                 n = read.test_x.shape[0]
-                out[i] = (
-                    np.asarray(got["quantiles"], dtype=np.float64).reshape(n, len(alphas[i])),
-                    np.asarray(got["raw_quantiles"], dtype=np.float64).reshape(n, -1),
+                out[i] = Answered(
+                    {
+                        "tabicl": (
+                            np.asarray(got["quantiles"], dtype=np.float64).reshape(n, len(alphas[i])),
+                            np.asarray(got["raw_quantiles"], dtype=np.float64).reshape(n, -1),
+                        )
+                    },
                     id_,
                 )
             except (KernelError, ContextUnknown) as e:
                 out[i] = e
             except Exception as e:  # the package's own refusals, by their text
                 out[i] = KernelError(f"bands: {e}")
+        self._series_voices(reads, alphas, out)
         return out
+
+    def _series_voices(self, reads: list[Read], alphas: list[list[float]], out: list) -> None:
+        """The voices that read the series, added to the reads that asked
+        for them and were answered. Chronos-2 takes every such series of
+        the cycle asking the same levels in one batch. A voice's grid is
+        its answer at the levels asked (the door asks the percentiles)."""
+        asking = [i for i, r in enumerate(reads) if isinstance(out[i], Answered) and len(r.voices) > 1]
+        for i in asking:
+            read = reads[i]
+            if "seasonal_naive" in read.voices:
+                try:
+                    q = voices.seasonal_naive(read.history, read.horizon, list(alphas[i]), read.season)
+                    out[i].voices["seasonal_naive"] = (q, np.sort(q, axis=1))
+                except voices.VoiceError as e:
+                    out[i] = KernelError(f"bands: {e}")
+        by_levels: dict[tuple, list[int]] = {}
+        for i in asking:
+            if isinstance(out[i], Answered) and "chronos2" in reads[i].voices:
+                by_levels.setdefault(tuple(alphas[i]), []).append(i)
+        for levels, mine in by_levels.items():
+            try:
+                got = self.chronos.quantiles([reads[i].history for i in mine], [reads[i].horizon for i in mine], list(levels))
+            except Exception:
+                # One series a voice will not read must not fail the others: find whose.
+                got = []
+                for i in mine:
+                    try:
+                        got.append(self.chronos.quantiles([reads[i].history], [reads[i].horizon], list(levels))[0])
+                    except Exception as e:
+                        got.append(KernelError(f"bands: {e}"))
+            for i, q in zip(mine, got):
+                if isinstance(q, Exception):
+                    out[i] = q
+                else:
+                    out[i].voices["chronos2"] = (q, np.sort(q, axis=1))
 
     def _keep(self, read: Read, members: int) -> str:
         """The read's context, built and kept unless this caller already has it."""

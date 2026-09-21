@@ -21,6 +21,7 @@ from typing import Callable
 import numpy as np
 
 from .. import calibration
+from .. import voices as service
 
 MIN_TRAIN = 5  # the walk's floor on training rows
 
@@ -128,21 +129,17 @@ def nori(model: str = "nori-6m") -> Backend:
 
 
 class SeasonalNaive:
-    """The floor: the same month last year, banded by the spread of the
-    series' own year-over-year changes."""
+    """The floor — the service's own `voices.seasonal_naive`, a panel at a time."""
 
     name = "seasonal_naive"
 
     def step(self, y, moy, alphas, h=1):
         out = np.full((y.shape[0], len(alphas)), np.nan)
         for s in range(y.shape[0]):
-            v = _trim(y[s])
-            # A year back from the month to call, while that is known; else the last month.
-            lag = 12 if v.shape[0] > 12 + MIN_TRAIN and h <= 12 else h
-            if v.shape[0] <= lag + MIN_TRAIN or np.isnan(v[h - 1 - lag]):
+            try:
+                out[s] = service.seasonal_naive(y[s], np.array([h]), list(alphas))[0]
+            except service.VoiceError:
                 continue
-            moves = v[lag:] - v[:-lag]
-            out[s] = v[h - 1 - lag] + np.quantile(moves[~np.isnan(moves)], alphas)
         return out
 
 
@@ -212,31 +209,21 @@ class Pooled:
 
 
 class Chronos:
-    """A time-series model reading each series alone, all of them in one batch."""
+    """A time-series model reading each series alone, all of them in one
+    batch — the service's own `voices.Chronos2`, a panel at a time."""
 
-    def __init__(self, name: str = "chronos2", model: str = "amazon/chronos-2", context: int = 512):
-        from chronos import BaseChronosPipeline
-
+    def __init__(self, name: str = "chronos2"):
         from ..kernels import pick_device
 
-        self.name, self.context, self.record = name, context, "chronos2"
-        device = pick_device()
-        self.pipeline = BaseChronosPipeline.from_pretrained(model, device_map="cpu" if device == "mps" else device)
+        self.name, self.record = name, "chronos2"
+        self.voice = service.Chronos2(pick_device())
 
     def step(self, y, moy, alphas, h=1):
-        import torch
-
         out = np.full((y.shape[0], len(alphas)), np.nan)
-        called, inputs = [], []
-        for s in range(y.shape[0]):
-            v = _trim(y[s])[-self.context :]
-            if v.shape[0] < MIN_TRAIN + 1:
-                continue
-            called.append(s)
-            inputs.append(torch.tensor(v, dtype=torch.float32))
+        called = [s for s in range(y.shape[0]) if service._known(y[s]).shape[0] >= service.MIN_HISTORY]
         if called:
-            quantiles, _mean = self.pipeline.predict_quantiles(inputs, prediction_length=h, quantile_levels=list(alphas))
-            out[called] = np.stack([np.asarray(q, dtype=np.float64).reshape(-1, len(alphas))[-1] for q in quantiles])
+            got = self.voice.quantiles([y[s] for s in called], [np.array([h])] * len(called), list(alphas))
+            out[called] = np.stack([q[0] for q in got])
         return out
 
 

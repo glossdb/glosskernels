@@ -41,6 +41,7 @@ image = (
         "starlette>=1.6",
         "uvicorn>=0.52",
         "huggingface-hub>=0.30",
+        "chronos-forecasting>=2",
         # NVML behind torch.cuda.utilization: the busy fraction in the measurements.
         "nvidia-ml-py>=12",
     )
@@ -48,7 +49,9 @@ image = (
     # fetched here without the package on the path yet.
     .run_commands(
         "python -c \"from huggingface_hub import hf_hub_download; "
-        "hf_hub_download(repo_id='jingang/TabICL', filename='tabicl-regressor-v2-20260212.ckpt')\""
+        "hf_hub_download(repo_id='jingang/TabICL', filename='tabicl-regressor-v2-20260212.ckpt')\"",
+        # And the second voice's weights (glosskernels.voices.CHRONOS).
+        "python -c \"from huggingface_hub import snapshot_download; snapshot_download('amazon/chronos-2')\"",
     )
     .env({"HF_HUB_OFFLINE": "1", "PYTHONPATH": "/root"})
     .add_local_dir("src/glosskernels", remote_path="/root/glosskernels")
@@ -104,8 +107,10 @@ def batching(use_amp: bool = False, flushing_probe: bool = False) -> list:
     from glosskernels.measure import batching as run
     from glosskernels.measure import callers
 
+    from glosskernels.measure import spoken
+
     k = Kernels(use_amp=use_amp)
-    return [*run(k), callers(k)]
+    return [*run(k), callers(k), spoken(k)]
 
 
 @app.function(gpu=GPU, cpu=CPU, region=REGION, timeout=1800)

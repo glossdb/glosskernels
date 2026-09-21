@@ -25,8 +25,8 @@ GLOSSKERNELS_KEYS=k1 uv run glosskernels   # a bearer per caller
 | `GLOSSKERNELS_PREPARE_WORKERS` | processes preparing reads beside the model; default the cores but one, at most 8 |
 | `HF_HUB_OFFLINE` | `1` in the image: the checkpoint is baked, nothing is fetched at start |
 
-The checkpoint comes from the Hugging Face hub cache (`jingang/TabICL`,
-the v2 regressor). A container bakes it at build (`Dockerfile`); a
+The checkpoints come from the Hugging Face hub cache (`jingang/TabICL`,
+the v2 regressor; `amazon/chronos-2`, the second voice, loaded on first use). A container bakes it at build (`Dockerfile`); a
 laptop fetches it on first start.
 
 ## The wire
@@ -41,7 +41,11 @@ by name.
 | `POST /misfit` | `x` (rows × cols) | `scores` (per row; log density, higher fits the frame better) |
 | `GET /healthz` | | `status`, `device`, `loaded` |
 
-Every band read is `/bands`: a walk point is one read of one row with its
+With `voices` (`tabicl` and any of `chronos2`, `seasonal_naive`) each read
+also carries `history` — the series up to the origin — and optionally
+`horizon` per test row; every voice answers on its own under `voices`,
+beside their `blend`, and `pit_history` is then an object of histories by
+voice. Every band read is `/bands`: a walk point is one read of one row with its
 actual, a walk is many reads, a what-if or a projection is a read of many
 rows. `members` 1 (the default) runs the pinned member (one estimator, no
 normalization, no feature shuffle); more runs the package's ensemble of

@@ -85,10 +85,14 @@ class Owner:
     # -- the callers' side ---------------------------------------------------
 
     def bands(self, caller: str, reads: list, alphas: list[float], members: int) -> Future:
-        """`reads` are `kernels.Read`s; each is answered (quantiles, raw grid, context id)."""
+        """`reads` are `kernels.Read`s; each comes back `kernels.Answered`."""
         for read in reads:
             read.caller = caller
-        cells = members * sum(r.test_x.size + (0 if r.train_x is None else r.train_x.size) for r in reads)
+        cells = sum(
+            members * (r.test_x.size + (0 if r.train_x is None else r.train_x.size))
+            + (0 if r.history is None else r.history.size)
+            for r in reads
+        )
         return self._admit(_Job(caller, "bands", cells, Future(), reads, tuple(alphas), members))
 
     def exclusive(self, caller: str, name: str, cells: int, run: Callable[[Any], Any]) -> Future:

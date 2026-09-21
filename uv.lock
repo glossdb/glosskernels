@@ -337,6 +337,7 @@ name = "glosskernels"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "chronos-forecasting" },
     { name = "huggingface-hub" },
     { name = "numpy" },
     { name = "starlette" },
@@ -352,7 +353,6 @@ dev = [
     { name = "pytest" },
 ]
 harness = [
-    { name = "chronos-forecasting" },
     { name = "pandas" },
     { name = "pyarrow" },
     { name = "synthefy-nori" },
@@ -360,6 +360,7 @@ harness = [
 
 [package.metadata]
 requires-dist = [
+    { name = "chronos-forecasting", specifier = ">=2" },
     { name = "huggingface-hub", specifier = ">=0.30" },
     { name = "numpy", specifier = ">=2" },
     { name = "starlette", specifier = ">=1.6" },
@@ -375,7 +376,6 @@ dev = [
     { name = "pytest", specifier = ">=9" },
 ]
 harness = [
-    { name = "chronos-forecasting", specifier = ">=2" },
     { name = "pandas", specifier = ">=2.2" },
     { name = "pyarrow", specifier = ">=17" },
     { name = "synthefy-nori", specifier = ">=0.16.0" },

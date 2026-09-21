@@ -246,6 +246,34 @@ def callers(k: Kernels, clients: int = 16, requests: int = 8, points: int = 6) -
     return out
 
 
+def spoken(k: Kernels, series: int = 600, months: int = 36) -> dict:
+    """A cycle with every voice: `series` one-step reads (100 metrics x 6
+    walked months), TabICL's tables riding together and Chronos-2 taking
+    the series in one batch, against TabICL alone."""
+    from .kernels import Read
+    from .prepare import warm
+
+    rng = np.random.default_rng(6)
+    levels = ALPHAS + [round(a, 2) for a in np.arange(1, 100) / 100.0]
+    reads = []
+    for i in range(series):
+        v = 100.0 + np.cumsum(rng.normal(size=months)) + 5.0 * np.sin(np.arange(months) * np.pi / 6)
+        rows = 18 + i % 6
+        reads.append((rng.normal(size=(rows, 5)), rng.normal(size=rows), rng.normal(size=(1, 5)), v))
+    warm()
+    out: dict = {"reads": series}
+    for name, voices_ in (("tabicl", ("tabicl",)), ("all_three", ("tabicl", "chronos2", "seasonal_naive"))):
+        asking = [Read(q, x, y, voices=voices_, history=v, horizon=np.ones(1)) for x, y, q, v in reads]
+        k.answer(asking[:12], [levels] * 12, 1)  # warm: the shapes, and Chronos-2's load
+        _sync(k)
+        t = time.perf_counter()
+        got = k.answer(asking, [levels] * series, 1)
+        _sync(k)
+        refused = [g for g in got if isinstance(g, Exception)]
+        out[name] = {"s": round(time.perf_counter() - t, 2), "refused": len(refused), **({"first": str(refused[0])[:160]} if refused else {})}
+    return out
+
+
 def kept(k: Kernels, rows_list: tuple[int, ...] = (5000, 20000), members: int = 8, cols: int = 20, queries: int = 100) -> list[dict]:
     """The context cache as the service runs it (`Kernels.answer`): the
     build, a query by id, and how far the kept read stands from the fp32
@@ -276,9 +304,9 @@ def kept(k: Kernels, rows_list: tuple[int, ...] = (5000, 20000), members: int = 
                 build_s = time.perf_counter() - t
                 t = time.perf_counter()
                 for _ in range(5):
-                    (got,) = k.answer([Read(q, context=built[2], caller="measure")], [ALPHAS], members)
+                    (got,) = k.answer([Read(q, context=built.context, caller="measure")], [ALPHAS], members)
                 _sync(k)
-                dev = np.abs(got[0] - reference[0]).max(axis=1) / float(np.std(y))
+                dev = np.abs(got.voices["tabicl"][0] - reference.voices["tabicl"][0]).max(axis=1) / float(np.std(y))
                 entry[name] = {
                     "build_s": round(build_s, 2),
                     "query_s": round((time.perf_counter() - t) / 5, 3),

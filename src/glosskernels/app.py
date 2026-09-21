@@ -26,7 +26,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from . import calibration, kernels
+from . import calibration, kernels, voices
+from .voices import blend as voices_blend
 from .contexts import ContextUnknown
 from .owner import Busy, Owner, TooLarge
 
@@ -171,6 +172,10 @@ def _door(read):
     return endpoint
 
 
+# The levels a voice's PIT is read from when several voices answer: the percentiles.
+GRID = [round(a, 2) for a in np.arange(1, 100) / 100.0]
+
+
 class Bands:
     """Quantiles for query rows given context rows — every band read:
     a walk point is one read of one row with its actual, a walk is many
@@ -183,10 +188,17 @@ class Bands:
     kept and its id returned as `context`; a later read sends that id in
     place of the rows and pays only for its query rows — until the
     context ages out, when the answer is a 404 and the rows are sent
-    again. With `pit_history` (a hundred counts of
-    past PITs, zeros for a caller with none yet) the `quantiles` are
-    read through that record and the kernel's default one, and `raw`
-    carries the answer as the model spoke it."""
+    again. With `pit_history` (a hundred counts of past PITs, zeros for
+    a caller with none yet) the `quantiles` are read through that record
+    and the kernel's default one, and `raw` carries the answer as the
+    model spoke it.
+
+    With `voices` — `tabicl` and any of `chronos2`, `seasonal_naive` —
+    each read also carries `history` (the series up to the origin) and
+    may carry `horizon` (per test row, how many months past the history
+    it lies; 1 where left out). Every voice answers on its own under
+    `voices`, beside their `blend`; `pit_history` is then an object of
+    histories by voice name (`blend` among them)."""
 
     @staticmethod
     def parse(body):
@@ -196,11 +208,14 @@ class Bands:
         members = body.get("members", 1)
         if not isinstance(members, int) or isinstance(members, bool) or not 1 <= members <= 32:
             raise Refusal("`members` is an integer from 1 to 32", 400)
-        history = None
-        if body.get("pit_history") is not None:
-            history = _matrix(body, "pit_history", ndim=1)
-            if history.shape != (calibration.BINS,) or np.isnan(history).any() or (history < 0).any():
-                raise Refusal(f"`pit_history` is {calibration.BINS} non-negative counts", 400)
+        asked = body.get("voices")
+        if asked is not None and (
+            not isinstance(asked, list) or "tabicl" not in asked or len(set(asked)) != len(asked) or set(asked) - set(voices.VOICES)
+        ):
+            raise Refusal(f"`voices` names `tabicl` and any of {list(voices.SERIES_VOICES)}, each once", 400)
+        season = body.get("season", 12)
+        if not isinstance(season, int) or isinstance(season, bool) or not 1 <= season <= 366:
+            raise Refusal("`season` is the season's length in periods, an integer", 400)
         parsed = []
         for i, read in enumerate(reads):
             if not isinstance(read, dict):
@@ -213,37 +228,107 @@ class Bands:
                 one |= {"train_x": _matrix(read, "train_x", ndim=2), "train_y": _matrix(read, "train_y", ndim=1)}
             if not isinstance(one["cache"], bool):
                 raise Refusal(f"read {i}: `cache` is true or false", 400)
-            for name in ("actual", "salt"):
+            rows = one["test_x"].shape[0]
+            for name in ("actual", "salt", "horizon"):
                 one[name] = _matrix(read, name, ndim=1) if read.get(name) is not None else None
-                if one[name] is not None and one[name].shape[0] != one["test_x"].shape[0]:
+                if one[name] is not None and one[name].shape[0] != rows:
                     raise Refusal(f"read {i}: `{name}` has one entry per test row", 400)
+            one["history"] = None
+            if asked and len(asked) > 1:
+                one["history"] = _matrix(read, "history", ndim=1)
+                if one["horizon"] is None:
+                    one["horizon"] = np.ones(rows)
+                h = one["horizon"]
+                if np.isnan(h).any() or (h != np.round(h)).any() or (h < 1).any() or (h > 120).any():
+                    raise Refusal(f"read {i}: `horizon` is whole periods past the history, 1 to 120", 400)
             parsed.append(one)
-        return {"reads": parsed, "alphas": _alphas(body), "members": members, "history": history}
+        return {
+            "reads": parsed,
+            "alphas": _alphas(body),
+            "members": members,
+            "voices": tuple(asked) if asked else None,
+            "season": season,
+            "histories": Bands._histories(body.get("pit_history"), asked),
+        }
 
     @staticmethod
-    async def serve(own: Owner, caller: str, reads, alphas, members, history):
-        asked = list(alphas)
-        if history is not None:
-            read_at = calibration.levels(alphas, history, calibration.default_record("tabicl"))
-            asked += np.clip(read_at, 0.001, 0.999).tolist()
-        answers = []
+    def _histories(value, asked) -> dict[str, np.ndarray] | None:
+        """PIT histories by voice; a bare list is TabICL's."""
+        if value is None:
+            return None
+        if asked and len(asked) > 1:
+            names = {*asked, "blend"}
+            if not isinstance(value, dict) or set(value) - names:
+                raise Refusal(f"with `voices`, `pit_history` is an object of histories by voice, any of {sorted(names)}", 400)
+        elif isinstance(value, dict):
+            raise Refusal("`pit_history` is a list of counts; by voice only with `voices`", 400)
+        else:
+            value = {"tabicl": value}
+        out = {}
+        for name, counts in value.items():
+            history = _matrix({"pit_history": counts}, "pit_history", ndim=1)
+            if history.shape != (calibration.BINS,) or np.isnan(history).any() or (history < 0).any():
+                raise Refusal(f"`pit_history` is {calibration.BINS} non-negative counts", 400)
+            out[name] = history
+        return out
+
+    @staticmethod
+    async def serve(own: Owner, caller: str, reads, alphas, members, voices, season, histories):
+        several = voices is not None and len(voices) > 1
+        n = len(alphas)
+        levels = list(alphas)
+        if several:
+            levels += GRID  # every voice's PIT, and its record's reading, come from the percentiles
+        elif histories is not None:
+            read_at = calibration.levels(alphas, histories["tabicl"], calibration.default_record("tabicl"))
+            levels += np.clip(read_at, 0.001, 0.999).tolist()
         asking = [
-            kernels.Read(r["test_x"], r.get("train_x"), r.get("train_y"), context=r["context"], cache=r["cache"])
+            kernels.Read(
+                r["test_x"], r.get("train_x"), r.get("train_y"), context=r["context"], cache=r["cache"],
+                voices=voices or ("tabicl",), history=r["history"], horizon=r["horizon"], season=season,
+            )
             for r in reads
-        ]
-        served = await asyncio.wrap_future(own.bands(caller, asking, asked, members))
-        for read, (quantiles, grid, context) in zip(reads, served):
-            answer = {"quantiles": quantiles[:, : len(alphas)]}
-            if history is not None:
-                answer = {"quantiles": np.sort(quantiles[:, len(alphas) :], axis=1), "raw": answer["quantiles"]}
+        ]  # fmt: skip
+        served = await asyncio.wrap_future(own.bands(caller, asking, levels, members))
+
+        def pits(read, grid):
+            landed = ~np.isnan(read["actual"])
+            pit = np.full(landed.shape[0], np.nan)
+            salt = None if read["salt"] is None else read["salt"][landed].astype(np.int64)
+            pit[landed] = calibration.pit(grid[landed], read["actual"][landed], salt)
+            return pit
+
+        def through_its_record(name, read, on_grid):
+            """A voice among several: its bands at the alphas, read through
+            its record off its percentiles; the default record only where
+            every row is one step out, which is what it was built on."""
+            answer = {"quantiles": on_grid[:, :n]}
+            grid = np.sort(on_grid[:, n:], axis=1)
+            if histories is not None and name in histories:
+                default = calibration.default_record(name) if (read["horizon"] == 1).all() else None
+                read_at = calibration.levels(alphas, histories[name], default)
+                answer = {"quantiles": np.stack([np.interp(read_at, GRID, row) for row in grid]), "raw": answer["quantiles"]}
             if read["actual"] is not None:
-                landed = ~np.isnan(read["actual"])
-                pit = np.full(landed.shape[0], np.nan)
-                salt = None if read["salt"] is None else read["salt"][landed].astype(np.int64)
-                pit[landed] = calibration.pit(grid[landed], read["actual"][landed], salt)
-                answer["pit"] = pit
-            if context is not None:
-                answer["context"] = context
+                answer["pit"] = pits(read, grid)
+            return answer
+
+        answers = []
+        for read, got in zip(reads, served):
+            if several:
+                spoken = {name: through_its_record(name, read, q) for name, (q, _grid) in got.voices.items()}
+                # The bands and the percentiles are two sets of levels: blended apart.
+                spoke = [q for q, _grid in got.voices.values()]
+                together = np.hstack([voices_blend([q[:, :n] for q in spoke]), voices_blend([q[:, n:] for q in spoke])])
+                answer = {"voices": spoken, "blend": through_its_record("blend", read, together)}
+            else:
+                quantiles, grid = got.voices["tabicl"]
+                answer = {"quantiles": quantiles[:, :n]}
+                if histories is not None:
+                    answer = {"quantiles": np.sort(quantiles[:, n:], axis=1), "raw": answer["quantiles"]}
+                if read["actual"] is not None:
+                    answer["pit"] = pits(read, grid)
+            if got.context is not None:
+                answer["context"] = got.context
             answers.append(answer)
         return {"reads": answers}
 

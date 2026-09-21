@@ -54,9 +54,10 @@ projection is a read of many rows.
 | `reads[].salt` | an integer naming each point (a hash of metric and month); places a tied actual repeatably |
 | `pit_history` | 100 counts of past PITs per hundredth (zeros for a caller with none yet): `quantiles` are then read through that record and the kernel's default one, and `raw` carries the model's own answer |
 | `reads[].cache` | keep this context; the answer carries its `context` id, and a later read sends `"context": "<id>"` in place of the rows |
-| `voices`, `reads[].history` | more than one voice answers: each comes back on its own, with their `blend`; a voice that reads a series takes it from `history` |
+| `voices`, `reads[].history`, `reads[].horizon`, `season` | `tabicl` and any of `chronos2`, `seasonal_naive`: each answers on its own under `voices`, beside their `blend` (the level-by-level mean). The series voices read `history` — the series up to the origin — `horizon` periods out per test row (1 where left out). `pit_history` is then an object of histories by voice, `blend` among them; the default record is weighed in only one step out, which is what it was built on — a projection is calibrated a horizon per request |
 
-The answer is `{"reads": [{"quantiles", "raw"?, "pit"?, "context"?, "support"?, "voices"?}]}`.
+The answer is `{"reads": [{"quantiles", "raw"?, "pit"?, "context"?, "support"?}]}`, or
+with `voices`, `{"reads": [{"voices": {name: {"quantiles", "raw"?, "pit"?}}, "blend": {…}, "context"?}]}`.
 `support` says, per query row, whether each feature lies inside what the
 context has seen — a what-if is honest inside (its median 0.06 of the truth
 off, against replay's 0.15) and must be flagged outside.
@@ -227,8 +228,11 @@ entity scoring · synthetic twins.
 - [ ] Shapes side by side: parallel launch chains (free-threaded 3.14t on
       CUDA) or CUDA graphs per shape. Done when sixteen callers' small walks
       keep an L4 over 60% busy.
-- [ ] Voices and `blend` (Chronos-2, seasonal-naive), per-horizon records.
-      Done when the harness holds: at or under the naive floor at every
-      horizon, annual-total coverage within 5 points of 80 (64–72 today).
+- [x] Voices and `blend` through `/bands` (`voices.py`: Chronos-2 batched
+      across a cycle's series, seasonal-naive), each read through its own
+      record. The harness grades the same functions.
+- [ ] Projections held in the harness: at or under the naive floor at every
+      horizon (met by the three-voice blend), annual-total coverage within 5
+      points of 80 (64–72 today) — per-horizon default records are the lever.
 - [ ] `/misfit` per column.
 - [ ] glossql moves to this API.

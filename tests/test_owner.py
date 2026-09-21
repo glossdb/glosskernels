@@ -6,7 +6,7 @@ import threading
 import numpy as np
 import pytest
 
-from glosskernels.kernels import KernelError, Read
+from glosskernels.kernels import Answered, KernelError, Read
 from glosskernels.owner import Busy, Owner, TooLarge
 
 
@@ -25,7 +25,7 @@ class Gated:
         return [
             KernelError(f"bands: read {i}: no")
             if r.train_x[0, 0] < 0
-            else (np.full((1, len(a)), r.train_x[0, 0]), np.zeros((1, 3)), None)
+            else Answered({"tabicl": (np.full((1, len(a)), r.train_x[0, 0]), np.zeros((1, 3)))})
             for i, (r, a) in enumerate(zip(reads, alphas))
         ]
 
@@ -50,8 +50,8 @@ def test_waiting_callers_ride_one_cycle_and_get_their_own_answers():
     a = own.bands("a", [read(1.0), read(2.0)], [0.1, 0.9], 1)
     b = own.bands("b", [read(3.0)], [0.5], 1)
     kernel.gate.set()
-    assert [q[0].tolist() for q, _grid, _kept in a.result(5)] == [[1.0, 1.0], [2.0, 2.0]]
-    assert [q[0].tolist() for q, _grid, _kept in b.result(5)] == [[3.0]]
+    assert [got.voices["tabicl"][0][0].tolist() for got in a.result(5)] == [[1.0, 1.0], [2.0, 2.0]]
+    assert [got.voices["tabicl"][0][0].tolist() for got in b.result(5)] == [[3.0]]
     assert kernel.cycles[1] == [1.0, 2.0, 3.0]
     assert own.stats["largest_cycle_jobs"] == 2
 
@@ -62,7 +62,7 @@ def test_a_refused_read_fails_its_own_caller_only_and_names_the_callers_index():
     good = own.bands("a", [read(1.0)], [0.5], 1)
     bad = own.bands("b", [read(2.0), read(-1.0)], [0.5], 1)
     kernel.gate.set()
-    assert good.result(5)[0][0].tolist() == [[1.0]]
+    assert good.result(5)[0].voices["tabicl"][0].tolist() == [[1.0]]
     with pytest.raises(KernelError, match="read 1: no"):  # the cycle's index was 2
         bad.result(5)
 
