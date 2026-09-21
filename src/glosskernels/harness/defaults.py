@@ -1,5 +1,6 @@
-"""Build the default calibration record the kernel ships: each voice
-walked over the public panels, its PITs counted per hundredth.
+"""Build the default calibration records the kernel ships: each voice
+walked over the public panels, its PITs counted per hundredth — a month
+ahead on the months, and a year ahead on their trailing annual totals.
 
     uv run python -m glosskernels.harness.defaults
 
@@ -16,22 +17,26 @@ from .. import calibration
 from . import panels, score, voices
 
 BUILT_FROM = ("tourism_monthly", "hospital")
-VOICES = ("walk:tabicl", "chronos2")
+VOICES = ("walk:tabicl", "chronos2", "seasonal_naive")
+WINDOWS = {1: 1, calibration.TOTAL_WINDOW: calibration.TOTAL_WINDOW}  # window -> the horizon it is walked at
 
 
 def build(series: int = 60, months: int = 18) -> dict:
     records: dict[str, dict[str, list[float]]] = {}
     for name in VOICES:
         (voice,) = voices.build([name])
-        pits = []
-        for panel_name in BUILT_FROM:
-            panel = panels.load(panel_name).head(series)
-            total = panel.y.shape[1]
-            for t in range(total - months, total):
-                q, actual = voice.step(panel.y[:, :t], panel.moy[: t + 1], score.GRID), panel.y[:, t]
-                landed = ~np.isnan(actual) & ~np.isnan(q).any(axis=1)
-                pits.append(calibration.pit(q[landed], actual[landed], np.flatnonzero(landed) * 100_003 + t))
-        records[voice.record] = {"1": calibration.histogram(np.concatenate(pits)).tolist()}
+        records[voice.record] = {}
+        for window, h in WINDOWS.items():
+            pits = []
+            for panel_name in BUILT_FROM:
+                panel = panels.load(panel_name).head(series)
+                y = panel.y if window == 1 else score.trailing_sum(panel.y, window)
+                total = y.shape[1]
+                for t in range(total - months - h + 1, total - h + 1):
+                    q, actual = voice.step(y[:, :t], panel.moy[: t + h], score.GRID, h), y[:, t + h - 1]
+                    landed = ~np.isnan(actual) & ~np.isnan(q).any(axis=1)
+                    pits.append(calibration.pit(q[landed], actual[landed], np.flatnonzero(landed) * 100_003 + t))
+            records[voice.record][str(window)] = calibration.histogram(np.concatenate(pits)).tolist()
     return {
         "built_from": list(BUILT_FROM),
         "series_per_panel": series,

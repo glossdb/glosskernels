@@ -44,6 +44,17 @@ def test_recalibrate_widens_a_narrow_voice_from_its_histogram():
     assert raw_cover < 0.7 and abs(cover - 0.8) < 0.03
 
 
+def test_the_shipped_records_are_the_months_and_the_totals():
+    for voice in ("tabicl", "chronos2", "seasonal_naive"):
+        months, totals = calibration.default_record(voice), calibration.default_record(voice, 12)
+        assert months.shape == totals.shape == (calibration.BINS,) and months.sum() > 1000 and totals.sum() > 1000
+        # Every voice is surer of a total than it should be: more of its PITs at the ends.
+        ends = lambda counts: (counts[:10].sum() + counts[-10:].sum()) / counts.sum()  # noqa: E731
+        assert ends(totals) > ends(months)
+        assert np.array_equal(calibration.default_record(voice, 4), totals)  # any sum of periods is a total
+    assert calibration.default_record("blend") is None  # the blend is made of voices already read
+
+
 def test_no_history_speaks_raw_and_a_default_gives_way_to_the_tenants_own():
     q = np.tile(norm.ppf(LEVELS), (2, 1))
     assert calibration.recalibrate(q, LEVELS) is q

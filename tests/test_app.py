@@ -184,6 +184,13 @@ def test_voices_are_read_through_their_own_records(client):
     (read,) = client.post("/bands", json=body).json()["reads"]
     assert "raw" not in read["voices"]["tabicl"] and read["voices"]["chronos2"]["raw"] == [[11.5]] * 2
     assert read["voices"]["chronos2"]["quantiles"][0][0] > 11.98
+    # The blend is of the voices as read: TabICL raw, Chronos through its record.
+    assert read["blend"]["quantiles"][0][0] == pytest.approx((1.5 + read["voices"]["chronos2"]["quantiles"][0][0]) / 2)
+    # A trailing total is weighed with the totals' default record, not the months'.
+    flat = {"pit_history": {"tabicl": [1] * 100}, "alphas": [0.1, 0.9]}
+    month, total = (client.post("/bands", json=body | flat | {"window": w}).json()["reads"][0] for w in (1, 12))
+    width = lambda r: r["voices"]["tabicl"]["quantiles"][0][1] - r["voices"]["tabicl"]["quantiles"][0][0]  # noqa: E731
+    assert width(total) > width(month)
 
 
 def test_voices_refusals(client):
@@ -196,3 +203,5 @@ def test_voices_refusals(client):
     assert r.status_code == 400 and "by voice" in r.json()["error"]
     r = client.post("/bands", json={"alphas": [0.5], "voices": ["tabicl", "chronos2"], "reads": [READ | {"history": [1, 2, 3], "horizon": [0, 1]}]})
     assert r.status_code == 400 and "horizon" in r.json()["error"]
+    r = client.post("/bands", json=base | {"window": 0})
+    assert r.status_code == 400 and "window" in r.json()["error"]

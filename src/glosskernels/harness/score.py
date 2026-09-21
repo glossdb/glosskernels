@@ -14,6 +14,7 @@ import numpy as np
 
 from .. import calibration
 from .panels import Panel
+from .voices import ask
 
 BANDS = [0.05, 0.10, 0.50, 0.90, 0.95]  # the door's alphas
 GRID = [round(a, 2) for a in np.arange(1, 100) / 100.0]
@@ -73,7 +74,7 @@ def project(panel: Panel, voices: list, origins: int = 2, horizon: int = 12, bur
         for v in voices:
             for h in scored_at:
                 v.step(panel.y[:, :t], panel.moy[: t + h], GRID, h)
-            v.step(rolling[:, :t], panel.moy[: t + horizon], GRID, horizon)
+            ask(v, rolling[:, :t], panel.moy[: t + horizon], GRID, horizon, window=horizon)
 
     shape = (panel.y.shape[0], origins)
     monthly = {v.name: np.full((*shape, horizon, len(GRID)), np.nan) for v in voices}
@@ -85,7 +86,7 @@ def project(panel: Panel, voices: list, origins: int = 2, horizon: int = 12, bur
             start = time.perf_counter()
             for h in range(1, horizon + 1):
                 monthly[v.name][:, o, h - 1] = v.step(panel.y[:, :t], panel.moy[: t + h], GRID, h)
-            direct[v.name][:, o] = v.step(rolling[:, :t], panel.moy[: t + horizon], GRID, horizon)
+            direct[v.name][:, o] = ask(v, rolling[:, :t], panel.moy[: t + horizon], GRID, horizon, window=horizon)
             seconds[v.name] += time.perf_counter() - start
 
     out = {"panel": panel.name, "series": int(shape[0]), "origins": origins, "horizon": horizon, "burn": burn, "voices": {}}

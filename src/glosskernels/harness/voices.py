@@ -131,7 +131,7 @@ def nori(model: str = "nori-6m") -> Backend:
 class SeasonalNaive:
     """The floor — the service's own `voices.seasonal_naive`, a panel at a time."""
 
-    name = "seasonal_naive"
+    name = record = "seasonal_naive"
 
     def step(self, y, moy, alphas, h=1):
         out = np.full((y.shape[0], len(alphas)), np.nan)
@@ -235,13 +235,20 @@ class _Once:
         self.inner, self.name, self._answers = inner, inner.name, {}
         self.record = getattr(inner, "record", None)
 
-    def step(self, y, moy, alphas, h=1):
+    def step(self, y, moy, alphas, h=1, window=1):
         # The last known column tells one panel from another cut at the
         # same origin — the months, and their trailing sums.
         key = (y.shape[1], h, len(alphas), y[:, -1].tobytes())
         if key not in self._answers:
-            self._answers[key] = self.inner.step(y, moy, alphas, h)
+            self._answers[key] = ask(self.inner, y, moy, alphas, h, window)
         return self._answers[key]
+
+
+def ask(voice, y, moy, alphas, h=1, window=1):
+    """Only a voice that reads a record has a use for the window."""
+    if isinstance(voice, (_Once, Calibrated, Blend)):
+        return voice.step(y, moy, alphas, h, window)
+    return voice.step(y, moy, alphas, h)
 
 
 class Calibrated:
@@ -266,12 +273,13 @@ class Calibrated:
         # `cal:` reads the voice through its own record alone — the grade of
         # the method. `dcal:` adds the kernel's shipped default record, as a
         # deployment does; grade it only on panels the default was not built from.
+        # A series is taken for a trailing total when `window` says so.
         self.inner, self.shipped = inner, shipped
         self.name = f"{'dcal' if shipped else 'cal'}:{inner.name}"
         self._pending: dict[tuple, np.ndarray] = {}  # (panel, h, origin) -> the raw answer
         self._pits: dict[tuple, list[np.ndarray]] = {}  # (panel, h) -> landed PITs
 
-    def step(self, y, moy, alphas, h=1):
+    def step(self, y, moy, alphas, h=1, window=1):
         raw = self.inner.step(y, moy, alphas, h)
         t = y.shape[1]
         # A panel is known by its first two years — the same under every
@@ -287,7 +295,7 @@ class Calibrated:
         landed = self._pits.get((panel, h))
         history = calibration.histogram(np.concatenate(landed)) if landed else None
         record = getattr(self.inner, "record", None)
-        default = calibration.default_record(record, h) if self.shipped and record else None
+        default = calibration.default_record(record, window) if self.shipped and record else None
         return calibration.recalibrate(raw, alphas, history, default)
 
 
@@ -299,8 +307,8 @@ class Blend:
     def __init__(self, voices: list):
         self.voices, self.name = voices, "blend:" + "+".join(v.name for v in voices)
 
-    def step(self, y, moy, alphas, h=1):
-        return np.mean([np.sort(v.step(y, moy, alphas, h), axis=1) for v in self.voices], axis=0)
+    def step(self, y, moy, alphas, h=1, window=1):
+        return np.mean([np.sort(ask(v, y, moy, alphas, h, window), axis=1) for v in self.voices], axis=0)
 
 
 def build(names: list[str]) -> list:

@@ -16,6 +16,15 @@ A tenant's counts are added to a default record shipped with the kernel
 observations): a new tenant is read honestly on the first day, and its
 own record takes over as it grows. No tenant's PITs reach another's.
 
+The default is kept per voice and per `window` — how many periods each
+value of the series sums. A month (window 1) is read through the
+one-step record at every horizon: records built per horizon read the
+held-out panels no better. A trailing total (an annual total as its own
+series) has its own record, because every voice is too sure of one — a
+trailing sum is smooth, and its past months say little about how far a
+year's total lands from the last (raw 80% bands held 50-85% of held-out
+annual totals; through this record TabICL's held 69-78%).
+
 PITs are always taken against the raw answer, never the recalibrated
 one — a record of corrected answers would chase its own correction."""
 
@@ -75,9 +84,13 @@ def _defaults() -> dict:
     return json.loads(path.read_text())["records"] if path.exists() else {}
 
 
-def default_record(voice: str, horizon: int = 1) -> np.ndarray | None:
-    """The shipped record for a voice at a horizon, or None."""
-    counts = _defaults().get(voice, {}).get(str(horizon))
+TOTAL_WINDOW = 12  # the window the shipped totals record was built on
+
+
+def default_record(voice: str, window: int = 1) -> np.ndarray | None:
+    """The shipped record for a voice, or None: the months' where each
+    value is one period, the totals' where it sums several."""
+    counts = _defaults().get(voice, {}).get(str(1 if window <= 1 else TOTAL_WINDOW))
     return None if counts is None else np.asarray(counts, dtype=np.float64)
 
 

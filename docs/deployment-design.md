@@ -54,7 +54,8 @@ projection is a read of many rows.
 | `reads[].salt` | an integer naming each point (a hash of metric and month); places a tied actual repeatably |
 | `pit_history` | 100 counts of past PITs per hundredth (zeros for a caller with none yet): `quantiles` are then read through that record and the kernel's default one, and `raw` carries the model's own answer |
 | `reads[].cache` | keep this context; the answer carries its `context` id, and a later read sends `"context": "<id>"` in place of the rows |
-| `voices`, `reads[].history`, `reads[].horizon`, `season` | `tabicl` and any of `chronos2`, `seasonal_naive`: each answers on its own under `voices`, beside their `blend` (the level-by-level mean). The series voices read `history` — the series up to the origin — `horizon` periods out per test row (1 where left out). `pit_history` is then an object of histories by voice, `blend` among them; the default record is weighed in only one step out, which is what it was built on — a projection is calibrated a horizon per request |
+| `voices`, `reads[].history`, `reads[].horizon`, `season` | `tabicl` and any of `chronos2`, `seasonal_naive`: each answers on its own under `voices`, beside their `blend` (the level-by-level mean). The series voices read `history` — the series up to the origin — `horizon` periods out per test row (1 where left out). `pit_history` is then an object of histories by voice, `blend` among them — one record per request, so a projection is asked a horizon per request. The blend is of the voices as read, each through its record |
+| `window` | how many periods each value of the series sums: 1 (the default), a month; 12, a trailing annual total asked for as its own series. It picks the default record a history is weighed with |
 
 The answer is `{"reads": [{"quantiles", "raw"?, "pit"?, "context"?, "support"?}]}`, or
 with `voices`, `{"reads": [{"voices": {name: {"quantiles", "raw"?, "pit"?}}, "blend": {…}, "context"?}]}`.
@@ -134,8 +135,36 @@ reuses it. Built (`contexts.py`, `Kernels.answer`): on an L4 a 20k-row,
 - The PIT is tie-aware: an actual tied with part of the grid (a zero month
   of a mostly-zero metric) is placed uniformly within the tie, from the
   row's bytes and its `salt`, so a replay repeats it.
-- Projections keep a record per horizon; a what-if is calibrated from the
-  factual reads of the same context (measured: as narrow as its what-ifs).
+- The default is kept per voice and per `window`, not per horizon. A month
+  is read through the one-step record however far out: records built per
+  horizon read the held-out panels no better (TabICL at twelve months,
+  80% bands: 57/69/88 raw, 60/73/86 through a twelve-month record, 62/76/91
+  through the one-step one). An annual total asked for as its own series
+  has its own record, because every voice is too sure of one — a trailing
+  sum is smooth, and says little about how far the next year's lands. On
+  the three panels the default was not built from, 80% bands on annual
+  totals held:
+
+  | | raw | through the totals record |
+  |---|---|---|
+  | TabICL | 50 / 57 / 55 | 78 / 78 / 69 |
+  | Chronos-2 | 85 / 62 / 72 | 90 / 65 / 77 |
+  | seasonal-naive | 80 / 57 / 50 | 87 / 68 / 54 |
+  | blend of the three | 87 / 65 / 65 | 96 / 79 / 75 |
+
+  (fred_md / cif_2016 / car_parts; 428, 192 and 282 totals.) The panels
+  differ from each other by more than any default can close — fred_md's
+  blend is over-covered, car_parts' still short — which is the tenant's
+  own record's part: it takes over from the default as it grows.
+- The blend has no default record: it is the mean of the voices as read,
+  each through its own. Against giving the blend a record of its own the
+  two came out even over months and totals (179 against 187 points of
+  coverage error, raw 227), and this one ships nothing per combination of
+  voices. A caller's `blend` history is read on top, its PITs taken
+  against that mean.
+- The caller keeps a record per horizon, and one for a total; a what-if is
+  calibrated from the factual reads of the same context (measured: as
+  narrow as its what-ifs).
 
 ## Keeping the device busy
 
@@ -243,9 +272,11 @@ entity scoring · synthetic twins.
 - [x] Voices and `blend` through `/bands` (`voices.py`: Chronos-2 batched
       across a cycle's series, seasonal-naive), each read through its own
       record. The harness grades the same functions.
-- [ ] Projections held in the harness: at or under the naive floor at every
-      horizon (met by the three-voice blend), annual-total coverage within 5
-      points of 80 (64–72 today) — per-horizon default records are the lever.
+- [x] Projections held in the harness: at or under the naive floor at every
+      horizon (met by the three-voice blend). Annual totals: the lever was a
+      default record for totals (`window`), not one per horizon — the blend's
+      80% bands hold 79 and 75 of 100 on two held-out panels (65 raw) and
+      over-cover the third (96, from 87); the tenant's own record closes the rest.
 - [x] `/misfit` per column (`columns: true`): the conditionals the score sums, returned unsummed;
       `folds` to score rows from a context they are not in.
 - [ ] glossql moves to this API.

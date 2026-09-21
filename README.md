@@ -37,7 +37,7 @@ by name.
 
 | route | body | answer |
 |---|---|---|
-| `POST /bands` | `alphas`, `reads` (each `train_x`, `train_y`, `test_x` rows × cols — or `context` in place of the train rows — and optionally `actual` and `salt` per test row, `cache`), `members`, `pit_history` | per read: `quantiles` (rows × alphas), `pit` where an actual was given, `raw` when a `pit_history` was, `context` when kept |
+| `POST /bands` | `alphas`, `reads` (each `train_x`, `train_y`, `test_x` rows × cols — or `context` in place of the train rows — and optionally `actual` and `salt` per test row, `cache`), `members`, `pit_history`, `window` | per read: `quantiles` (rows × alphas), `pit` where an actual was given, `raw` when a `pit_history` was, `context` when kept |
 | `POST /misfit` | `x` (rows × cols), `columns`, `folds` | `scores` (per row; log density, higher fits the frame better) and, with `columns: true`, `columns` (rows × cols; each column's share of the row's score — they sum to it, the lowest names the cell) |
 | `GET /healthz` | | `status`, `device`, `loaded` |
 
@@ -45,7 +45,9 @@ With `voices` (`tabicl` and any of `chronos2`, `seasonal_naive`) each read
 also carries `history` — the series up to the origin — and optionally
 `horizon` per test row; every voice answers on its own under `voices`,
 beside their `blend`, and `pit_history` is then an object of histories by
-voice. Every band read is `/bands`: a walk point is one read of one row with its
+voice, and the blend is of the voices as read through them. `window`
+(1; 12 for a trailing annual total asked for as its own series) picks the
+default record a history is weighed with. Every band read is `/bands`: a walk point is one read of one row with its
 actual, a walk is many reads, a what-if or a projection is a read of many
 rows. `members` 1 (the default) runs the pinned member (one estimator, no
 normalization, no feature shuffle); more runs the package's ensemble of
@@ -110,9 +112,11 @@ Calibration is the kernel's (`glosskernels.calibration`): a pure
 function of the raw answer and a histogram of the PITs the caller kept,
 added to a default record the kernel ships (`calibration_default.json`,
 rebuilt by `python -m glosskernels.harness.defaults` from tourism_monthly
-and hospital). `cal:<voice>` grades the method on a voice's own record;
+and hospital: per voice, one record for months and one for trailing annual
+totals). `cal:<voice>` grades the method on a voice's own record;
 `dcal:<voice>` reads as a deployment would, default record included —
-grade it on the other panels. The design for the first deployment is in
+grade it on the other panels; `blend:dcal:<voice>+dcal:<voice>` is the
+blend as the service forms it. The design for the first deployment is in
 `docs/deployment-design.md`.
 
 Panels: `tourism_monthly`, `hospital`, `car_parts`, `fred_md`, `cif_2016` (the Monash archive

@@ -198,7 +198,12 @@ class Bands:
     may carry `horizon` (per test row, how many months past the history
     it lies; 1 where left out). Every voice answers on its own under
     `voices`, beside their `blend`; `pit_history` is then an object of
-    histories by voice name (`blend` among them)."""
+    histories by voice name (`blend` among them). The blend is of the
+    voices as read — each through its record, where it has one.
+
+    `window` says how many periods each value of the series sums (1, a
+    month; 12, a trailing annual total asked for as its own series): it
+    picks the default record a history is weighed with."""
 
     @staticmethod
     def parse(body):
@@ -216,6 +221,9 @@ class Bands:
         season = body.get("season", 12)
         if not isinstance(season, int) or isinstance(season, bool) or not 1 <= season <= 366:
             raise Refusal("`season` is the season's length in periods, an integer", 400)
+        window = body.get("window", 1)
+        if not isinstance(window, int) or isinstance(window, bool) or not 1 <= window <= 366:
+            raise Refusal("`window` is how many periods each value sums, an integer", 400)
         parsed = []
         for i, read in enumerate(reads):
             if not isinstance(read, dict):
@@ -248,6 +256,7 @@ class Bands:
             "members": members,
             "voices": tuple(asked) if asked else None,
             "season": season,
+            "window": window,
             "histories": Bands._histories(body.get("pit_history"), asked),
         }
 
@@ -273,14 +282,14 @@ class Bands:
         return out
 
     @staticmethod
-    async def serve(own: Owner, caller: str, reads, alphas, members, voices, season, histories):
+    async def serve(own: Owner, caller: str, reads, alphas, members, voices, season, window, histories):
         several = voices is not None and len(voices) > 1
         n = len(alphas)
         levels = list(alphas)
         if several:
             levels += GRID  # every voice's PIT, and its record's reading, come from the percentiles
         elif histories is not None:
-            read_at = calibration.levels(alphas, histories["tabicl"], calibration.default_record("tabicl"))
+            read_at = calibration.levels(alphas, histories["tabicl"], calibration.default_record("tabicl", window))
             levels += np.clip(read_at, 0.001, 0.999).tolist()
         asking = [
             kernels.Read(
@@ -298,28 +307,37 @@ class Bands:
             pit[landed] = calibration.pit(grid[landed], read["actual"][landed], salt)
             return pit
 
-        def through_its_record(name, read, on_grid):
+        def through_its_record(name, read, bands, grid):
             """A voice among several: its bands at the alphas, read through
-            its record off its percentiles; the default record only where
-            every row is one step out, which is what it was built on."""
-            answer = {"quantiles": on_grid[:, :n]}
-            grid = np.sort(on_grid[:, n:], axis=1)
+            its record off its percentiles — and those percentiles as read,
+            which is what the blend is made of. The PIT is against the raw."""
+            answer, as_read = {"quantiles": bands}, grid
             if histories is not None and name in histories:
-                default = calibration.default_record(name) if (read["horizon"] == 1).all() else None
-                read_at = calibration.levels(alphas, histories[name], default)
-                answer = {"quantiles": np.stack([np.interp(read_at, GRID, row) for row in grid]), "raw": answer["quantiles"]}
+                default = calibration.default_record(name, window)
+
+                def re_read(levels):
+                    read_at = calibration.levels(levels, histories[name], default)
+                    return np.stack([np.interp(read_at, GRID, row) for row in grid])
+
+                answer, as_read = {"quantiles": re_read(alphas), "raw": bands}, re_read(GRID)
             if read["actual"] is not None:
                 answer["pit"] = pits(read, grid)
-            return answer
+            return answer, as_read
 
         answers = []
         for read, got in zip(reads, served):
             if several:
-                spoken = {name: through_its_record(name, read, q) for name, (q, _grid) in got.voices.items()}
+                spoke = {
+                    name: through_its_record(name, read, q[:, :n], np.sort(q[:, n:], axis=1))
+                    for name, (q, _grid) in got.voices.items()
+                }
                 # The bands and the percentiles are two sets of levels: blended apart.
-                spoke = [q for q, _grid in got.voices.values()]
-                together = np.hstack([voices_blend([q[:, :n] for q in spoke]), voices_blend([q[:, n:] for q in spoke])])
-                answer = {"voices": spoken, "blend": through_its_record("blend", read, together)}
+                bands = voices_blend([answer["quantiles"] for answer, _ in spoke.values()])
+                percentiles = voices_blend([as_read for _, as_read in spoke.values()])
+                answer = {
+                    "voices": {name: answer for name, (answer, _) in spoke.items()},
+                    "blend": through_its_record("blend", read, bands, percentiles)[0],
+                }
             else:
                 quantiles, grid = got.voices["tabicl"]
                 answer = {"quantiles": quantiles[:, :n]}
