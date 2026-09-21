@@ -149,8 +149,8 @@ class SeasonalNaive:
 class Walk:
     """The graded protocol: each series alone, its own months the context."""
 
-    def __init__(self, name: str, backend: Backend, rows=recipe):
-        self.name, self.backend, self.rows = name, backend, rows
+    def __init__(self, name: str, backend: Backend, rows=recipe, record: str | None = None):
+        self.name, self.backend, self.rows, self.record = name, backend, rows, record
 
     def step(self, y, moy, alphas, h=1):
         out = np.full((y.shape[0], len(alphas)), np.nan)
@@ -219,7 +219,7 @@ class Chronos:
 
         from ..kernels import pick_device
 
-        self.name, self.context = name, context
+        self.name, self.context, self.record = name, context, "chronos2"
         device = pick_device()
         self.pipeline = BaseChronosPipeline.from_pretrained(model, device_map="cpu" if device == "mps" else device)
 
@@ -246,6 +246,7 @@ class _Once:
 
     def __init__(self, inner):
         self.inner, self.name, self._answers = inner, inner.name, {}
+        self.record = getattr(inner, "record", None)
 
     def step(self, y, moy, alphas, h=1):
         # The last known column tells one panel from another cut at the
@@ -274,8 +275,12 @@ class Calibrated:
     outside the raw grid's ends cannot be reached — a voice too narrow
     past its first percentile stays so."""
 
-    def __init__(self, inner, min_history: int = calibration.MIN_HISTORY):
-        self.inner, self.name, self.min_history = inner, f"cal:{inner.name}", min_history
+    def __init__(self, inner, shipped: bool = False):
+        # `cal:` reads the voice through its own record alone — the grade of
+        # the method. `dcal:` adds the kernel's shipped default record, as a
+        # deployment does; grade it only on panels the default was not built from.
+        self.inner, self.shipped = inner, shipped
+        self.name = f"{'dcal' if shipped else 'cal'}:{inner.name}"
         self._pending: dict[tuple, np.ndarray] = {}  # (panel, h, origin) -> the raw answer
         self._pits: dict[tuple, list[np.ndarray]] = {}  # (panel, h) -> landed PITs
 
@@ -288,11 +293,15 @@ class Calibrated:
         for key in sorted(k for k in self._pending if k[0] == panel and k[2] + k[1] - 1 < t):
             answer, actual = self._pending.pop(key), y[:, key[2] + key[1] - 1]
             landed = ~np.isnan(actual) & ~np.isnan(answer).any(axis=1)
-            self._pits.setdefault(key[:2], []).append(calibration.pit(answer[landed], actual[landed]))
+            # A point is a series at a month: what its tie draw is salted with.
+            salt = np.flatnonzero(landed) * 100_003 + key[2]
+            self._pits.setdefault(key[:2], []).append(calibration.pit(answer[landed], actual[landed], salt))
         self._pending[(panel, h, t)] = raw
-        history = self._pits.get((panel, h))
-        pits = np.concatenate(history) if history else np.zeros(0)
-        return calibration.recalibrate(raw, alphas, pits, self.min_history)
+        landed = self._pits.get((panel, h))
+        history = calibration.histogram(np.concatenate(landed)) if landed else None
+        record = getattr(self.inner, "record", None)
+        default = calibration.default_record(record, h) if self.shipped and record else None
+        return calibration.recalibrate(raw, alphas, history, default)
 
 
 class Blend:
@@ -313,7 +322,7 @@ def build(names: list[str]) -> list:
     both. One whose package is not installed says so."""
     makers = {
         "seasonal_naive": SeasonalNaive,
-        "walk:tabicl": lambda: Walk("walk:tabicl", tabicl(ensemble=False)),
+        "walk:tabicl": lambda: Walk("walk:tabicl", tabicl(ensemble=False), record="tabicl"),
         "seasonal:tabicl": lambda: Walk("seasonal:tabicl", tabicl(ensemble=False), rows=seasonal_recipe),
         "pooled:tabicl": lambda: Pooled("pooled:tabicl", tabicl(ensemble=True)),
         "walk:nori": lambda: Walk("walk:nori", nori()),
@@ -335,6 +344,8 @@ def build(names: list[str]) -> list:
     def named(name: str):
         if name.startswith("cal:"):
             return Calibrated(named(name[4:]))
+        if name.startswith("dcal:"):
+            return Calibrated(named(name[5:]), shipped=True)
         if name.startswith("blend:"):
             if name not in raw:
                 raw[name] = _Once(Blend([named(part) for part in name[6:].split("+")]))

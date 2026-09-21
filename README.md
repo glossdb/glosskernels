@@ -95,10 +95,15 @@ panel against replay's arithmetic alone, inside and outside the prices
 the panel has seen, clean and with a demand shock no column holds.
 
 Calibration is the kernel's (`glosskernels.calibration`): a pure
-function of the raw answer and the PITs the caller kept. The record
-stores PITs and hands them back; the statistics stay here.
+function of the raw answer and a histogram of the PITs the caller kept,
+added to a default record the kernel ships (`calibration_default.json`,
+rebuilt by `python -m glosskernels.harness.defaults` from tourism_monthly
+and hospital). `cal:<voice>` grades the method on a voice's own record;
+`dcal:<voice>` reads as a deployment would, default record included —
+grade it on the other panels. The design for the first deployment is in
+`docs/deployment-design.md`.
 
-Panels: `tourism_monthly`, `hospital`, `car_parts` (the Monash archive
+Panels: `tourism_monthly`, `hospital`, `car_parts`, `fred_md`, `cif_2016` (the Monash archive
 from the hub) and `synthetic` (no network). Nori wants torch
 under 2.14, and uv resolves every group into one lock, so the `harness`
 group holds the whole lock at 2.13; the parity tests pass on 2.13 and 2.14.

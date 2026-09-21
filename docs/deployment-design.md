@@ -139,14 +139,23 @@ history.
   Measured: another panel's record mends coverage nearly as well as a
   panel's own (77 → 84 vs 83 at a nominal 80); only the *shape* of the
   misses needs the tenant's own history.
+  Graded on three panels the default was not built from (fred_md,
+  cif_2016, car_parts), with a tenant's own PITs accruing beside it as
+  they would in service: TabICL's 80/90 coverage goes from 69/84 and
+  70/84 to 78/89 and 80/88, the PITs' distance from uniform halves, and
+  the quantile loss does not move; on the mostly-zero car_parts it no
+  longer does harm (82/91 → 85/93, loss unchanged). Chronos-2 needs
+  little and gets little.
 - No tenant's PITs ever reach another tenant. The default comes from
   public data only.
 - PITs are always taken against the **raw** answer.
-- **Before the wire is fixed: a tie-aware PIT.** On a mostly-zero metric
-  (car_parts) the current PIT counts every tied quantile as "under", and
-  calibrating on it made honest bands too wide. The new PIT places a tied
-  actual uniformly within its tie, the draw derived from the request so a
-  replay repeats it. `band_point` moves to it when glossql changes.
+- **The PIT is tie-aware** (built): an actual tied with part of the grid —
+  a zero month under a voice whose lower quantiles are all zero — is
+  placed uniformly within the tie, the draw taken from the row's bytes and
+  a caller-supplied `salt` (any integer naming the point, e.g. a hash of
+  metric and month), so a replay repeats it. Without this a mostly-zero
+  metric's PITs pile at one end and calibration widens honest bands.
+  `band_point`'s PIT moves to it when glossql changes.
 
 ## Sharing the device
 
@@ -221,7 +230,8 @@ a C++ frontend · per-tenant fine-tuning · attribution · entity scoring
 
 ## Build order and what "done" means
 
-1. Tie-aware PIT and the default calibration record (small; blocks the wire).
+1. ~~Tie-aware PIT and the default calibration record~~ — built:
+   `glosskernels.calibration`, `calibration_default.json`.
 2. Contexts door with the soft-state cache, on one GPU owner with the
    async queue. *Done when:* a 20k-row ensemble builds in ≤ 6 s and a
    cached query answers in ≤ 0.25 s (p50) on an L4, inside the fast tier's

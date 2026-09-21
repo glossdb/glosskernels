@@ -20,6 +20,10 @@ PANELS = {
     "tourism_monthly": "monash_tourism_monthly",
     "hospital": "monash_hospital",
     "car_parts": "monash_car_parts",
+    # Held out of the default calibration record: macro indicators, and a
+    # mixed bag of short real and synthetic monthlies.
+    "fred_md": "monash_fred_md",
+    "cif_2016": "monash_cif_2016",
 }
 
 

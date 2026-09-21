@@ -12,6 +12,7 @@ import time
 
 import numpy as np
 
+from .. import calibration
 from .panels import Panel
 
 BANDS = [0.05, 0.10, 0.50, 0.90, 0.95]  # the door's alphas
@@ -137,7 +138,7 @@ def score(q: np.ndarray, actual: np.ndarray) -> dict:
     bands = q[:, _AT]
     gap = actual[:, None] - bands
     pinball = np.maximum(np.asarray(BANDS) * gap, (np.asarray(BANDS) - 1.0) * gap)
-    pit = np.sort((q <= actual[:, None]).sum(axis=1) / (len(GRID) + 1))
+    pit = np.sort(calibration.pit(q, actual))
     n = pit.shape[0]
     ks = max(np.max(np.arange(1, n + 1) / n - pit), np.max(pit - np.arange(n) / n))
     scale = max(float(np.abs(actual).sum()), 1e-12)
