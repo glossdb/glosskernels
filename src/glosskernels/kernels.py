@@ -1,16 +1,15 @@
-"""The three reads over the reference package, one loaded checkpoint.
+"""The reads over the reference package, one loaded checkpoint.
 
-`Kernels` holds the regressor checkpoint on one device and answers the
-three model calls the server's `FunctionRuntime` makes. Each read
-mirrors the graded protocol the candle port was held to:
+`Kernels` holds the regressor checkpoint on one device and answers two
+reads:
 
-- `band_point`: the pinned member (one estimator, no normalization, no
-  feature shuffle) — the metric-bands walk; quantiles at the alphas
-  and the PIT of the actual against the monotone raw quantile grid.
-- `band_grid`: the package's default ensemble (eight members over the
-  `none` and `power` pipelines with latin feature shuffles) — the
-  what-if replay, where sparse grids are the regime the ensemble was
-  ruled in for.
+- `bands`: quantiles for query rows given context rows. One member is
+  the pinned one (one estimator, no normalization, no feature shuffle) —
+  the metric-bands walk; more is the package's ensemble (the `none` and
+  `power` pipelines with latin feature shuffles) — the what-if replay,
+  where sparse grids are the regime the ensemble was ruled in for.
+  `band_point` and `band_grid` are those two as the oracle fixtures pin
+  them, kept for the parity tests.
 - `misfit`: the chain-rule density over one frame, fit and scored on
   the same rows, log space, mean over permutations — higher fits the
   frame better; the server negates.
@@ -95,63 +94,57 @@ class Kernels:
 
     # -- the reads --------------------------------------------------------
 
-    def band_point(
+    def bands(
         self,
         train_x: np.ndarray,
         train_y: np.ndarray,
         test_x: np.ndarray,
         alphas: list[float],
-        actual: float,
-    ) -> tuple[list[float], float]:
+        members: int = 1,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Quantiles (test rows x alphas) and the raw quantile grid (test
+        rows x grid) for `test_x` given the context rows. One member is
+        the pinned one (no normalization, no feature shuffle); more is
+        the package's ensemble of that size."""
         rows, cols = train_x.shape
-        if rows < 2 or train_y.shape[0] != rows or test_x.shape[0] != cols:
+        if rows < 2 or train_y.shape[0] != rows or test_x.ndim != 2 or test_x.shape[1] != cols:
             raise KernelError(
-                f"band_point: {rows} rows x {cols} features against {train_y.shape[0]} values "
-                f"and {test_x.shape[0]} test features"
-            )
-        est = self._regressor(
-            n_estimators=1, norm_methods="none", feat_shuffle_method="none", random_state=0
-        )
-        try:
-            est.fit(train_x, train_y)
-            out = est.predict(test_x[None, :], output_type=["quantiles", "raw_quantiles"], alphas=alphas)
-        except Exception as e:  # the package's own refusals, by their text
-            raise KernelError(f"band_point: {e}") from e
-        quantiles = np.asarray(out["quantiles"], dtype=np.float64).reshape(-1)
-        grid = np.asarray(out["raw_quantiles"], dtype=np.float64).reshape(-1)
-        pit = float(np.count_nonzero(grid <= actual)) / (grid.shape[0] + 1)
-        return quantiles.tolist(), pit
-
-    def band_grid(
-        self,
-        train_x: np.ndarray,
-        train_y: np.ndarray,
-        test_x: np.ndarray,
-        alphas: list[float],
-    ) -> np.ndarray:
-        rows, cols = train_x.shape
-        if rows < 2 or train_y.shape[0] != rows or test_x.shape[1] != cols:
-            raise KernelError(
-                f"band_grid: {rows} train rows x {cols} features against {train_y.shape[0]} "
-                f"train values and {test_x.shape[1]} test features"
+                f"bands: {rows} train rows x {cols} features against {train_y.shape[0]} train values "
+                f"and test rows of shape {test_x.shape}"
             )
         # The package's preprocessor drops constant columns (mean-imputed
         # first) and its member generator fails on an empty set with a
-        # message about sequences; say what happened instead — the same
-        # refusal the candle path gave.
+        # message about sequences; say what happened instead.
         imputed = np.where(np.isnan(train_x), np.nanmean(train_x, axis=0), train_x)
-        if not np.any(imputed != imputed[0], axis=0).any():
+        if members > 1 and not np.any(imputed != imputed[0], axis=0).any():
             raise KernelError(
-                "band_grid: every feature column is constant over the training rows — "
-                "nothing varies to band on"
+                "bands: every feature column is constant over the training rows — nothing varies to band on"
             )
-        est = self._regressor(random_state=0)
+        if members == 1:
+            est = self._regressor(n_estimators=1, norm_methods="none", feat_shuffle_method="none", random_state=0)
+        else:
+            est = self._regressor(n_estimators=members, random_state=0)
         try:
             est.fit(train_x, train_y)
-            q = est.predict(test_x, output_type="quantiles", alphas=alphas)
-        except Exception as e:
-            raise KernelError(f"band_grid: {e}") from e
-        return np.asarray(q, dtype=np.float64).reshape(test_x.shape[0], len(alphas))
+            out = est.predict(test_x, output_type=["quantiles", "raw_quantiles"], alphas=alphas)
+        except Exception as e:  # the package's own refusals, by their text
+            raise KernelError(f"bands: {e}") from e
+        n = test_x.shape[0]
+        return (
+            np.asarray(out["quantiles"], dtype=np.float64).reshape(n, len(alphas)),
+            np.asarray(out["raw_quantiles"], dtype=np.float64).reshape(n, -1),
+        )
+
+    def band_point(self, train_x, train_y, test_x, alphas, actual) -> tuple[list[float], float]:
+        """The walk point as the fixtures pin it: the pinned member, and
+        the PIT as the share of the raw grid at or under the actual."""
+        quantiles, grid = self.bands(train_x, train_y, test_x[None, :], alphas, members=1)
+        pit = float(np.count_nonzero(grid[0] <= actual)) / (grid.shape[1] + 1)
+        return quantiles[0].tolist(), pit
+
+    def band_grid(self, train_x, train_y, test_x, alphas) -> np.ndarray:
+        """The replay grid as the fixtures pin it: the default ensemble."""
+        return self.bands(train_x, train_y, test_x, alphas, members=8)[0]
 
     def misfit(
         self,

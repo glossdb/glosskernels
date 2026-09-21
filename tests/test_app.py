@@ -13,12 +13,10 @@ from glosskernels import kernels
 class Fake:
     device = "fake"
 
-    def band_point(self, train_x, train_y, test_x, alphas, actual):
-        assert train_x.shape == (3, 2) and np.isnan(train_x[1, 1])
-        return [float(a) for a in alphas], 0.5
-
-    def band_grid(self, train_x, train_y, test_x, alphas):
-        return np.full((test_x.shape[0], len(alphas)), 1.5)
+    def bands(self, train_x, train_y, test_x, alphas, members):
+        # Each quantile is its own level plus the member count; the grid is 1..9.
+        q = np.tile(np.asarray(alphas) + members, (test_x.shape[0], 1))
+        return q, np.tile(np.arange(1.0, 10.0), (test_x.shape[0], 1))
 
     def misfit(self, x):
         return np.array([0.1, float("nan")])
@@ -53,53 +51,56 @@ def client(monkeypatch):
     return _Sync()
 
 
-def test_band_point_nulls_ride_as_nan(client):
-    r = client.post(
-        "/v1/band_point",
-        json={
-            "train_x": [[1, 2], [3, None], [5, 6]],
-            "train_y": [1, 2, 3],
-            "test_x": [1, 2],
-            "alphas": [0.05, 0.5, 0.95],
-            "actual": 2.0,
-        },
-    )
+READ = {"train_x": [[1, 2], [3, None], [5, 6]], "train_y": [1, 2, 3], "test_x": [[1, 2], [3, 4]]}
+
+
+def test_bands_answers_every_read_and_pits_the_actuals(client):
+    body = {"alphas": [0.1, 0.9], "reads": [READ | {"actual": [4.5, None]}, READ], "members": 8}
+    r = client.post("/bands", json=body)
     assert r.status_code == 200, r.text
-    assert r.json() == {"quantiles": [0.05, 0.5, 0.95], "pit": 0.5}
+    first, second = r.json()["reads"]
+    assert first["quantiles"] == [[8.1, 8.9]] * 2
+    assert first["pit"] == [0.4, None]  # four of the nine grid points under 4.5, over ten
+    assert second == {"quantiles": [[8.1, 8.9]] * 2}
 
 
-def test_band_grid_is_rows_by_alphas(client):
-    r = client.post(
-        "/v1/band_grid",
-        json={"train_x": [[1], [2]], "train_y": [1, 2], "test_x": [[1], [2], [3]], "alphas": [0.1, 0.9]},
-    )
-    assert r.status_code == 200
-    assert r.json() == {"quantiles": [[1.5, 1.5]] * 3}
+def test_bands_reads_through_a_record_and_keeps_the_raw_answer(client):
+    # Every past actual fell in the top hundredth: the record reads every band far higher.
+    history = [0] * 99 + [5000]
+    r = client.post("/bands", json={"alphas": [0.1, 0.9], "reads": [READ], "pit_history": history})
+    assert r.status_code == 200, r.text
+    (read,) = r.json()["reads"]
+    assert read["raw"] == [[1.1, 1.9]] * 2
+    assert all(0.99 <= q - 1 <= 0.999 for q in read["quantiles"][0])
+    r = client.post("/bands", json={"alphas": [0.5], "reads": [READ], "pit_history": [1, 2]})
+    assert r.status_code == 400 and "100" in r.json()["error"]
 
 
 def test_misfit_non_finite_becomes_null(client):
-    r = client.post("/v1/misfit", json={"x": [[1, 2], [3, 4]]})
+    r = client.post("/misfit", json={"x": [[1, 2], [3, 4]]})
     assert r.status_code == 200
     assert r.json() == {"scores": [0.1, None]}
 
 
 def test_shape_and_type_refusals(client):
-    r = client.post("/v1/misfit", json={"x": [1, 2]})
+    r = client.post("/misfit", json={"x": [1, 2]})
     assert r.status_code == 400 and "dimension" in r.json()["error"]
-    r = client.post("/v1/band_point", json={"train_x": [[1]], "train_y": [1], "test_x": [1], "alphas": [1.5], "actual": 1})
+    r = client.post("/bands", json={"reads": [READ], "alphas": [1.5]})
     assert r.status_code == 400 and "alpha" in r.json()["error"]
-    r = client.post("/v1/band_grid", content=b"not json", headers={"content-type": "application/json"})
+    r = client.post("/bands", json={"reads": [READ | {"actual": [1.0]}], "alphas": [0.5]})
+    assert r.status_code == 400 and "per test row" in r.json()["error"]
+    r = client.post("/bands", content=b"not json", headers={"content-type": "application/json"})
     assert r.status_code == 400
 
 
 def test_keys_gate_when_set(client, monkeypatch):
     monkeypatch.setenv("GLOSSKERNELS_KEYS", "k1, k2")
     body = {"x": [[1, 2], [3, 4]]}
-    assert client.post("/v1/misfit", json=body).status_code == 401
-    assert client.post("/v1/misfit", json=body, headers={"authorization": "Bearer nope"}).status_code == 401
-    assert client.post("/v1/misfit", json=body, headers={"authorization": "Bearer k2"}).status_code == 200
+    assert client.post("/misfit", json=body).status_code == 401
+    assert client.post("/misfit", json=body, headers={"authorization": "Bearer nope"}).status_code == 401
+    assert client.post("/misfit", json=body, headers={"authorization": "Bearer k2"}).status_code == 200
     monkeypatch.delenv("GLOSSKERNELS_KEYS")
-    assert client.post("/v1/misfit", json=body).status_code == 200
+    assert client.post("/misfit", json=body).status_code == 200
 
 
 def test_healthz(client):

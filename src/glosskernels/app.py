@@ -1,8 +1,7 @@
-"""The doors of the kernel service: three reads over HTTP, JSON bodies.
+"""The doors of the kernel service: reads over HTTP, JSON bodies.
 
-The wire mirrors `FunctionRuntime` in the server (crates/session/src/
-session.rs): one route per model call, matrices as nested lists, a
-null where the server has NaN. Nothing here knows about datasets,
+One route per kind of read — `/bands` and `/misfit` — matrices as nested
+lists, a null where the caller has NaN. Nothing here knows about datasets,
 metrics or actors — a request is numbers and a key.
 
 Authentication: when `GLOSSKERNELS_KEYS` names one or more keys
@@ -26,7 +25,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from . import kernels
+from . import calibration, kernels
 
 # One model on one device answers one call at a time: the reads are
 # short, and the accelerators do not share a device across threads.
@@ -148,43 +147,64 @@ def _door(read):
     return endpoint
 
 
-class BandPoint:
-    """One fit, one test row: the band quantiles and the PIT of `actual`."""
+class Bands:
+    """Quantiles for query rows given context rows — every band read:
+    a walk point is one read of one row with its actual, a walk is many
+    reads, a what-if or a projection is a read of many rows.
+
+    `members` is 1 for the pinned member and more for the ensemble. A
+    read's `actual` (per test row, null where none) gets its PIT back,
+    always against the raw answer; `salt` names the points for the draw
+    that places a tied actual. With `pit_history` (a hundred counts of
+    past PITs, zeros for a caller with none yet) the `quantiles` are
+    read through that record and the kernel's default one, and `raw`
+    carries the answer as the model spoke it."""
 
     @staticmethod
     def parse(body):
-        train_x = _matrix(body, "train_x", ndim=2)
-        train_y = _matrix(body, "train_y", ndim=1)
-        test_x = _matrix(body, "test_x", ndim=1)
-        return {
-            "train_x": train_x,
-            "train_y": train_y,
-            "test_x": test_x,
-            "alphas": _alphas(body),
-            "actual": _scalar(body, "actual"),
-        }
+        reads = body.get("reads")
+        if not isinstance(reads, list) or not reads:
+            raise Refusal("`reads` must be a non-empty list", 400)
+        members = body.get("members", 1)
+        if not isinstance(members, int) or isinstance(members, bool) or not 1 <= members <= 32:
+            raise Refusal("`members` is an integer from 1 to 32", 400)
+        history = None
+        if body.get("pit_history") is not None:
+            history = _matrix(body, "pit_history", ndim=1)
+            if history.shape != (calibration.BINS,) or np.isnan(history).any() or (history < 0).any():
+                raise Refusal(f"`pit_history` is {calibration.BINS} non-negative counts", 400)
+        parsed = []
+        for i, read in enumerate(reads):
+            if not isinstance(read, dict):
+                raise Refusal(f"read {i} is a JSON object", 400)
+            one = {name: _matrix(read, name, ndim=ndim) for name, ndim in (("train_x", 2), ("train_y", 1), ("test_x", 2))}
+            for name in ("actual", "salt"):
+                one[name] = _matrix(read, name, ndim=1) if read.get(name) is not None else None
+                if one[name] is not None and one[name].shape[0] != one["test_x"].shape[0]:
+                    raise Refusal(f"read {i}: `{name}` has one entry per test row", 400)
+            parsed.append(one)
+        return {"reads": parsed, "alphas": _alphas(body), "members": members, "history": history}
 
     @staticmethod
-    def serve(k: kernels.Kernels, **a):
-        quantiles, pit = k.band_point(**a)
-        return {"quantiles": quantiles, "pit": pit}
-
-
-class BandGrid:
-    """The ensemble over replayed worlds: quantiles per test row."""
-
-    @staticmethod
-    def parse(body):
-        return {
-            "train_x": _matrix(body, "train_x", ndim=2),
-            "train_y": _matrix(body, "train_y", ndim=1),
-            "test_x": _matrix(body, "test_x", ndim=2),
-            "alphas": _alphas(body),
-        }
-
-    @staticmethod
-    def serve(k: kernels.Kernels, **a):
-        return {"quantiles": k.band_grid(**a)}
+    def serve(k: kernels.Kernels, reads, alphas, members, history):
+        asked = list(alphas)
+        if history is not None:
+            read_at = calibration.levels(alphas, history, calibration.default_record("tabicl"))
+            asked += np.clip(read_at, 0.001, 0.999).tolist()
+        answers = []
+        for read in reads:
+            quantiles, grid = k.bands(read["train_x"], read["train_y"], read["test_x"], asked, members)
+            answer = {"quantiles": quantiles[:, : len(alphas)]}
+            if history is not None:
+                answer = {"quantiles": np.sort(quantiles[:, len(alphas) :], axis=1), "raw": answer["quantiles"]}
+            if read["actual"] is not None:
+                landed = ~np.isnan(read["actual"])
+                pit = np.full(landed.shape[0], np.nan)
+                salt = None if read["salt"] is None else read["salt"][landed].astype(np.int64)
+                pit[landed] = calibration.pit(grid[landed], read["actual"][landed], salt)
+                answer["pit"] = pit
+            answers.append(answer)
+        return {"reads": answers}
 
 
 class Misfit:
@@ -207,8 +227,7 @@ async def healthz(_: Request) -> Response:
 app = Starlette(
     routes=[
         Route("/healthz", healthz, methods=["GET"]),
-        Route("/v1/band_point", _door(BandPoint), methods=["POST"]),
-        Route("/v1/band_grid", _door(BandGrid), methods=["POST"]),
-        Route("/v1/misfit", _door(Misfit), methods=["POST"]),
+        Route("/bands", _door(Bands), methods=["POST"]),
+        Route("/misfit", _door(Misfit), methods=["POST"]),
     ]
 )

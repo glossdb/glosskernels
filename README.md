@@ -1,6 +1,6 @@
 # glosskernels
 
-The kernel service behind glossql's three model doors: the metric-bands
+The kernel service behind glossql's model doors: the metric-bands
 walk, `whatif.<scenario>()` and `misfit.<frame>()`. The server carries
 no model; it calls this service at `GLOSSQL_TABICL_URL` with the bearer
 in `GLOSSQL_TABICL_TOKEN`. Behind the wire is the reference `tabicl`
@@ -27,23 +27,26 @@ laptop fetches it on first start.
 
 ## The wire
 
-JSON over HTTP, one route per model call, matrices as nested lists, a
-`null` where the server has NaN. Every answer is `{"error": …}` with a
-4xx when the read is refused, by name.
+JSON over HTTP, matrices as nested lists, a `null` where the caller has
+NaN. Every answer is `{"error": …}` with a 4xx when the read is refused,
+by name.
 
 | route | body | answer |
 |---|---|---|
-| `POST /v1/band_point` | `train_x` (rows × cols), `train_y`, `test_x` (cols), `alphas`, `actual` | `quantiles` (per alpha), `pit` |
-| `POST /v1/band_grid` | `train_x`, `train_y`, `test_x` (rows × cols), `alphas` | `quantiles` (rows × alphas) |
-| `POST /v1/misfit` | `x` (rows × cols) | `scores` (per row; log density, higher fits the frame better) |
+| `POST /bands` | `alphas`, `reads` (each `train_x`, `train_y`, `test_x` rows × cols, and optionally `actual` and `salt` per test row), `members`, `pit_history` | per read: `quantiles` (rows × alphas), `pit` where an actual was given, `raw` when a `pit_history` was |
+| `POST /misfit` | `x` (rows × cols) | `scores` (per row; log density, higher fits the frame better) |
 | `GET /healthz` | | `status`, `device`, `loaded` |
 
-`band_point` runs the pinned member (one estimator, no normalization,
-no feature shuffle) and reads the PIT off the monotone raw quantile
-grid. `band_grid` runs the package's default ensemble. `misfit` fits
-and scores the same frame over two feature orderings, numeric columns
-only. These are the protocols the candle port was graded to; the tests
-hold the reads to the port repo's pinned oracle fixtures.
+Every band read is `/bands`: a walk point is one read of one row with its
+actual, a walk is many reads, a what-if or a projection is a read of many
+rows. `members` 1 (the default) runs the pinned member (one estimator, no
+normalization, no feature shuffle); more runs the package's ensemble of
+that size. With `pit_history` — 100 counts of past PITs per hundredth —
+the quantiles are read through that record and the kernel's default one
+(`glosskernels.calibration`). `misfit` fits and scores the same frame over
+two feature orderings, numeric columns only. The tests hold the reads to
+the port repo's pinned oracle fixtures. Where this is going:
+`docs/deployment-design.md`.
 
 ## Hosts
 
@@ -79,8 +82,8 @@ uv run python -m glosskernels.harness --panel hospital --project 2 --burn 8 \\
 | voice | the context | the model |
 |---|---|---|
 | `seasonal_naive` | the series' own year-over-year moves | none — the floor |
-| `walk:tabicl` | one series' months, the walk's graded recipe | the pinned member (`band_point`) |
-| `pooled:tabicl` | the panel's recent rows, each series in its own units | the default ensemble (`band_grid`) |
+| `walk:tabicl` | one series' months, the walk's graded recipe | the pinned member (`members: 1`) |
+| `pooled:tabicl` | the panel's recent rows, each series in its own units | the ensemble (`members: 8`) |
 | `walk:nori`, `pooled:nori` | the same two contexts | Synthefy Nori (Apache-2.0) |
 | `chronos2` | each series alone, as a series | Chronos-2 (Apache-2.0) |
 | `seasonal:tabicl` | one series' months, rows anchored on the same month in the last years known — for calls further out | the pinned member |

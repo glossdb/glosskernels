@@ -81,30 +81,38 @@ def default_record(voice: str, horizon: int = 1) -> np.ndarray | None:
     return None if counts is None else np.asarray(counts, dtype=np.float64)
 
 
-def recalibrate(
-    quantiles: np.ndarray,
-    levels: list[float],
-    history: np.ndarray | None = None,
-    default: np.ndarray | None = None,
-) -> np.ndarray:
-    """`quantiles` (rows, levels) at increasing `levels`, re-read through
-    a record: the caller's `history` counts, and a `default` record
-    weighed in at `DEFAULT_WEIGHT`. Rows with an absent quantile stay
-    absent. What lies past the grid's ends cannot be reached: a voice too
-    narrow beyond its first level stays so."""
+def levels(alphas: list[float], history: np.ndarray | None = None, default: np.ndarray | None = None) -> np.ndarray:
+    """Where a record reads each alpha: the level under which a share
+    `alpha` of past PITs fell. The caller's `history` counts and a
+    `default` record weighed in at `DEFAULT_WEIGHT`; with too little of
+    either, the alphas themselves."""
     counts = np.zeros(BINS) if history is None else np.asarray(history, dtype=np.float64).copy()
     if counts.shape != (BINS,):
         raise ValueError(f"a PIT history is {BINS} counts, got {counts.shape}")
     if default is not None and default.sum() > 0:
         counts += default * (DEFAULT_WEIGHT / default.sum())
     if counts.sum() < MIN_HISTORY:
-        return quantiles
-    # The record's own quantile function: the level under which a share
-    # `alpha` of past PITs fell. A sliver per bin keeps it increasing.
-    counts = counts + 1e-9
+        return np.asarray(alphas, dtype=np.float64)
+    counts = counts + 1e-9  # a sliver per bin keeps the record's quantile function increasing
     share = np.concatenate([[0.0], np.cumsum(counts) / counts.sum()])
-    read_at = np.interp(levels, share, np.linspace(0.0, 1.0, BINS + 1))
+    return np.interp(alphas, share, np.linspace(0.0, 1.0, BINS + 1))
+
+
+def recalibrate(
+    quantiles: np.ndarray,
+    levels_: list[float],
+    history: np.ndarray | None = None,
+    default: np.ndarray | None = None,
+) -> np.ndarray:
+    """`quantiles` (rows, levels) on a fixed grid of increasing levels,
+    re-read through a record — for a caller that has the grid and cannot
+    ask the model again (the harness). Rows with an absent quantile stay
+    absent, and what lies past the grid's ends cannot be reached; the
+    service asks the model at `levels(...)` directly and has no such end."""
+    read_at = levels(levels_, history, default)
+    if np.array_equal(read_at, np.asarray(levels_, dtype=np.float64)):
+        return quantiles
     out = np.full_like(quantiles, np.nan)
     for row in np.flatnonzero(~np.isnan(quantiles).any(axis=1)):
-        out[row] = np.interp(read_at, levels, np.sort(quantiles[row]))
+        out[row] = np.interp(read_at, levels_, np.sort(quantiles[row]))
     return out

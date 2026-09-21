@@ -1,245 +1,169 @@
 # glosskernels — the first deployment
 
-Status: design agreed 2026-09-21; nothing here is built yet. What exists
-today is a proof of concept: three doors (`band_point`, `band_grid`,
-`misfit`) over the reference package, never deployed. Its reads stay as
-the graded reference — every fast path below is held to them — and glossql
-changes only once this is done.
-
-## What it is for
-
 One kernel service on one GPU, shared by every tenant of the SaaS, serving
-the three reads the product leans on — **bands, what-if, projections** —
-at cube scale. The proof of concept cannot do that for three measured reasons: every call
-refits its context, one lock serializes every caller, and a walk is
-hundreds of round trips of tiny tables.
+the reads the product leans on — **bands, what-if, projections**, and the
+misfit read — at cube scale.
 
 **What belongs in this service, and what does not.** It is shared by every
 tenant, so it carries only what needs the model, and the statistics that
 read the model's own output — calibration and blending happen here and
 nowhere else. Everything the caller can do stays with the caller:
-assembling contexts, building feature rows (glossql's walk recipe stays
-where it is), aggregating PIT histories. A request is numbers and a key,
-as it is today.
+assembling contexts, building feature rows, aggregating PIT histories. A
+request is numbers and a key.
 
-This repo stays open (Apache-2.0). It wraps open models; there is nothing
-secret in it. What is private is deployment — keys, the key→tenant map,
-quotas, infrastructure code — and that lives in `glossdeploy`, not here.
+The repo is open (Apache-2.0); it wraps open models. What is private is
+deployment — keys, the key→tenant map, quotas, infrastructure — and lives
+in `glossdeploy`.
 
-## What the design rests on (measured, fp16, 8-member ensemble, 20 columns)
+## The API
 
-| | T4 | L4 | L40S |
-|---|---|---|---|
-| walk point 24×5 | 0.15 s | 0.16 s | 0.04 s |
-| 20k-row panel, refit per query | 10.0 s | 4.5 s | 1.6 s |
-| 20k-row panel, cached: build → query | 10.6 → 0.33 s | 5.1 → 0.15 s | 1.9 → 0.08 s |
-| 100k-row panel, cached | OOM | OOM | 16 → 0.11 s (18.8 GB) |
+| route | what it answers |
+|---|---|
+| `POST /bands` | quantiles for query rows, given context rows |
+| `POST /misfit` | how well each row fits its frame; per column on request |
+| `GET /healthz` | `status`, `device`, `loaded` |
 
-- The KV cache costs **24 KB per row per ensemble member** (fp16). A cached
-  query costs about the same for 1 row or 100, and barely grows with the
-  panel.
-- Short reads leave the GPU 6–13% busy: they are bound by Python on the
-  host. Removing the lock changed no number on any GPU and *halved*
-  throughput on the L4 and L40S — threads are not how the device is shared.
-- A cold container answers after 6–11 s of checkpoint load (plus image
-  pull the first time); warm, 0.4 s.
+JSON, matrices as nested lists, `null` for NaN; a refusal is `{"error": …}`
+with a 4xx. A large context may be sent as Arrow IPC instead.
 
-**L4 (24 GB) is the target.** A 48 GB card (L40S, or RTX 6000-class on
-GCP) is the later tier for contexts past ~40k rows × 8 members. T4 is out.
+### `/bands`
+
+Every band read is the same operation, so it is one route: a walk point is
+one read of one row with its actual; a walk is many reads; a what-if or a
+projection is a read of many rows.
+
+```json
+{
+  "alphas": [0.05, 0.10, 0.50, 0.90, 0.95],
+  "members": 1,
+  "pit_history": [0, 3, 1, "… 100 counts"],
+  "voices": ["tabicl", "chronos2"],
+  "reads": [
+    {"train_x": [[…]], "train_y": […], "test_x": [[…]],
+     "actual": [13.2, null], "salt": [8812, 8813],
+     "history": […], "cache": true}
+  ]
+}
+```
+
+| field | meaning |
+|---|---|
+| `members` | 1 (default) is the pinned member — the walk; more is the ensemble of that size — what-if over sparse grids |
+| `reads[].train_x`, `train_y`, `test_x` | the context rows and the query rows |
+| `reads[].actual` | per query row, where one has landed: its `pit` comes back, always against the raw answer |
+| `reads[].salt` | an integer naming each point (a hash of metric and month); places a tied actual repeatably |
+| `pit_history` | 100 counts of past PITs per hundredth (zeros for a caller with none yet): `quantiles` are then read through that record and the kernel's default one, and `raw` carries the model's own answer |
+| `reads[].cache` | keep this context; the answer carries its `context` id, and a later read sends `"context": "<id>"` in place of the rows |
+| `voices`, `reads[].history` | more than one voice answers: each comes back on its own, with their `blend`; a voice that reads a series takes it from `history` |
+
+The answer is `{"reads": [{"quantiles", "raw"?, "pit"?, "context"?, "support"?, "voices"?}]}`.
+`support` says, per query row, whether each feature lies inside what the
+context has seen — a what-if is honest inside (its median 0.06 of the truth
+off, against replay's 0.15) and must be flagged outside.
+
+An annual total is asked for as its own series, never summed from monthly
+bands (summed bands covered 94–99% at a nominal 80).
+
+### `/misfit`
+
+`{"x": [[…]], "columns": true}` → `scores` per row (log density, higher
+fits better) and, with `columns`, per row × column: which cell made the row
+improbable.
 
 ## The context cache
 
 **Per tenant, across requests. Never shared between tenants, never per
-request.** The model's weights are shared by everyone; a context is a
-customer's data (and the cache is derived from it), so it belongs to one
-tenant — but within that tenant every request, user and read reuses it.
-That reuse is the whole gain: build once (5 s at 20k rows on an L4), then
-0.15 s per what-if, projection or band query.
+request.** The weights are shared by everyone; a context is a customer's
+data, so it belongs to one tenant — and within that tenant every request
+reuses it. Build once (5 s at 20k rows on an L4), then 0.15 s per query.
 
-- **Key**: `(tenant, sha256(context bytes), protocol, model version)`.
-  The tenant comes from the bearer key (`GLOSSKERNELS_KEYS` becomes a
-  key→tenant map). Two tenants uploading identical bytes get two entries:
-  a shared hit would tell one tenant that another holds the same data.
-- **Soft state.** The cache may vanish at any time (eviction, restart,
-  scale-down, a different instance). A query against an unknown context
-  answers `404 context_unknown` and the client uploads it again — glossql
-  can always rebuild a context from the record. Nothing is written to
-  disk. This is what makes the service portable across AWS, GCP, Scaleway
-  or Modal, and safe to scale to zero.
-- **Immutable.** A context is a snapshot. A new month is a new context
-  (the rows attend to each other, so there is no appending); the old one
-  ages out.
-- **Tiers.** GPU memory first (L4 budget ≈ 10 GB after the model and the
-  build's working set — about two 20k-row ensembles or ten 5k-row ones),
-  then pinned host RAM in fp16 (a reload is a copy, not a rebuild — to be
-  measured), then gone. LRU within a **per-tenant byte quota**, so one
-  tenant cannot evict everyone else.
-- **Deletion.** `DELETE` drops a context at once, and a tenant-wide purge
-  exists for offboarding.
-- **Builds are serialized** by the scheduler: the package writes the cache
-  onto the shared module during a build (`model._cache`), so two builds at
-  once would race. Queries carry their cache explicitly and do not.
-- **Size cap per context** in bytes (24 KB × rows × members), not rows: a
-  100k-row panel is fine with one or two members (2.4–4.8 GB). How much
-  band quality fewer members cost is a harness question, answered before
-  the cap is set.
-
-## The doors
-
-JSON stays for everything small. A context upload may be Arrow IPC
-(`Content-Type: application/vnd.apache.arrow.stream`) — at 100k × 20 the
-JSON parse alone is seconds of host time.
-
-| door | body | answer |
-|---|---|---|
-| `PUT /v1/contexts` | `train_x`, `train_y`, `protocol` (`pinned` \| `ensemble`), `members`, `tier` (`graded` \| `fast`) | `context` (the hash), `rows`, `cols`, `cache_mb`, `build_s` — idempotent |
-| `POST /v1/contexts/{id}/quantiles` | `test_x`, `alphas` or `grid: true`, `pit_history` (optional) | `quantiles` raw, `calibrated`, `support` per row |
-| `DELETE /v1/contexts/{id}` | | |
-| `POST /v1/band_walk` | many walk points in one request (below), `voices`, `pit_history` | per voice: `quantiles`, `pit`; plus `blend` and `calibrated` |
-| `POST /v1/project` | per horizon the caller's feature rows, plus `history` (the series, for the voices that read one), `alphas`, `voices`, `pit_history` per horizon | per voice and horizon: `quantiles`; `blend`, `calibrated`; `total` when asked |
-| `POST /v1/misfit` | `x`, `columns: true` | `scores` per row, and per row × column — which cell made the row improbable |
-
-- **What-if is the contexts door.** glossql assembles the panel (with the
-  attributes that place a lever against its usual level — the harness
-  showed the read fails without them), uploads it once, and asks for the
-  member's rows with the lever moved. `support` says, per query row,
-  whether each feature lies inside what the context has seen: the read is
-  honest inside (median 0.06 of truth off against replay's 0.15) and must
-  be flagged outside. The replay-grid `band_grid` stays as it is.
-- **`band_walk`** exists to end the round trips: 100 metrics × 6 points is
-  600 `band_point` calls, ~94 s on an L4 today. One request lets the kernel group
-  the points that share a shape into one forward pass (the model takes a
-  batch of same-shaped tables). *To verify:* the batched path must
-  reproduce `band_point` within the fast tier's tolerance on the pinned
-  fixtures before it serves anything.
-- **Voices.** `tabicl` always; `chronos2` as the second voice (it needs
-  the series, not feature rows, so walk points carry `history` too). Each
-  voice's answer is returned separately — they land as separate voices on
-  the witness plane — and `blend` is the level-by-level mean, with
-  `seasonal_naive` as a member for projections (the only configuration at
-  or under the naive floor at every horizon on both panels).
-- **Annual totals** are asked for as their own series (`total: 12`), never
-  summed from monthly bands — summed bands covered 94–99% at a nominal 80.
-- **Attribution is not in the first deployment.** Masking a column changes the context, so
-  each mask is a fresh build, not a cached query; it needs its own costing.
+- **Key**: `(tenant, sha256(context), members, model version)`; the tenant
+  comes from the bearer key. Identical bytes from two tenants are two
+  entries — a shared hit would tell one that another holds the same data.
+- **Soft state, memory only.** An entry may vanish at any time (idle
+  expiry, eviction, restart, another instance). An unknown `context`
+  answers `404 context_unknown` and the caller sends the rows again. This
+  is what keeps the service portable across providers and safe to scale
+  to zero.
+- **Immutable.** A new month is a new context; the old one ages out.
+- GPU memory first (≈ 10 GB on an L4 beside the model and a build's working
+  set), then pinned host RAM, then gone; LRU within a per-tenant byte quota.
+- Builds run one at a time (the package writes the cache onto the shared
+  module while building); queries carry their cache and do not contend.
+- The cap on a context is bytes — 24 KB × rows × members in fp16 — not
+  rows: 100k rows is fine with one or two members.
 
 ## Calibration
 
-A pure function here (`glosskernels.calibration`); the record keeps the
-history.
+`glosskernels.calibration`: a pure function of the answer and the record.
 
-- The request may carry `pit_history`: per voice and horizon, **a
-  histogram of past PITs — 100 counts, ~0.5 KB**, whatever the history's
-  length. Building it is a `GROUP BY` over stored PITs (deduplicated by
-  metric, month and voice); reading it is the kernel's.
-- The kernel ships a **default record** per voice and horizon, built from
-  the harness's public panels, counted as a fixed number of observations
-  (proposed: 200). A tenant's counts are added to it, so a new tenant gets
-  honest bands on day one and their own record takes over as it grows.
-  Measured: another panel's record mends coverage nearly as well as a
-  panel's own (77 → 84 vs 83 at a nominal 80); only the *shape* of the
-  misses needs the tenant's own history.
-  Graded on three panels the default was not built from (fred_md,
-  cif_2016, car_parts), with a tenant's own PITs accruing beside it as
-  they would in service: TabICL's 80/90 coverage goes from 69/84 and
-  70/84 to 78/89 and 80/88, the PITs' distance from uniform halves, and
-  the quantile loss does not move; on the mostly-zero car_parts it no
-  longer does harm (82/91 → 85/93, loss unchanged). Chronos-2 needs
-  little and gets little.
-- No tenant's PITs ever reach another tenant. The default comes from
-  public data only.
-- PITs are always taken against the **raw** answer.
-- **The PIT is tie-aware** (built): an actual tied with part of the grid —
-  a zero month under a voice whose lower quantiles are all zero — is
-  placed uniformly within the tie, the draw taken from the row's bytes and
-  a caller-supplied `salt` (any integer naming the point, e.g. a hash of
-  metric and month), so a replay repeats it. Without this a mostly-zero
-  metric's PITs pile at one end and calibration widens honest bands.
-  `band_point`'s PIT moves to it when glossql changes.
+- The caller keeps each landed PIT (data, like its training rows) and
+  sends them back as the 100-count histogram — a `GROUP BY`, half a
+  kilobyte whatever the history's length. Nothing is fitted: a band at
+  alpha is read at the level the past PITs put alpha at.
+- The kernel ships a default record per voice (`calibration_default.json`,
+  from public panels, counted as 200 observations); a tenant's counts are
+  added to it and take over as they grow. No tenant's PITs reach another.
+  On three panels the default was not built from, TabICL's 80/90 coverage
+  goes from 69/84, 70/84, 82/91 to 78/89, 80/88, 85/93 with the quantile
+  loss unchanged.
+- The PIT is tie-aware: an actual tied with part of the grid (a zero month
+  of a mostly-zero metric) is placed uniformly within the tie, from the
+  row's bytes and its `salt`, so a replay repeats it.
+- Projections keep a record per horizon; a what-if is calibrated from the
+  factual reads of the same context (measured: as narrow as its what-ifs).
 
 ## Sharing the device
 
-Async on the request side, one owner per GPU.
+- Requests are parsed on the event loop's thread pool and queued; **one
+  worker owns the GPU**, handlers `await` it. The host prepares the next
+  job while the GPU runs this one.
+- Short reads are bound by the host launching kernels, not by waiting
+  (GPU 6–13% busy): the remedy is many reads per request, grouped by shape
+  into one forward pass — 100 metrics × 6 points is ~94 s one at a time on
+  an L4.
+- Round-robin across tenants, short jobs ahead of long builds; past a queue
+  depth, `429` with `Retry-After`.
+- Reads are grouped within a request only, so one tenant's load never
+  changes another's numbers.
+- Precision is the service's business, not the caller's: fp32 for small
+  reads (exact, and faster — 16 s against 29 s for the pinned walk), fp16
+  only for large cached contexts and only once its deviation there is
+  measured. On the small fixtures fp16 is fine at the median (3e-4) and
+  percent-level wrong one fit in a hundred (worst 25%); bf16 is worse.
 
-- Requests are parsed and preprocessed on the event loop's thread pool
-  (numpy releases the GIL), then queued. **One worker owns the GPU** and
-  runs one job at a time; handlers `await` its result. Waiting on the GPU
-  costs the host nothing — CUDA launches are already asynchronous and the
-  worker blocks only where a result is copied back — so the host is free
-  to prepare the next job while the GPU runs this one.
-- What async does **not** fix: short reads are slow because the host is
-  *busy* launching kernels, not because it waits. That is what `band_walk`
-  batching is for, and later a CPU tier for small reads (deferred until
-  there is load to justify it).
-- **Fairness**: round-robin across tenants, short jobs ahead of long
-  builds; a queue-depth limit answers `429` with `Retry-After`.
-- **Batching is within one request only** at first. Nothing about one
-  tenant's load then changes another tenant's numbers, and a request is
-  reproducible. Batching across tenants waits for load, and for a decision
-  on whether bit-for-bit repeatability is promised.
-- More throughput on one GPU comes from worker *processes* (NVIDIA MPS),
-  not threads. Free-threaded Python stays a later experiment; the
-  `concurrency` measurement is its test.
+## Measured (fp16, 8 members, 20 columns)
 
-## Precision tiers
+| | T4 | L4 | L40S |
+|---|---|---|---|
+| walk point 24×5 | 0.15 s | 0.16 s | 0.04 s |
+| 20k-row context, refit per query | 10.0 s | 4.5 s | 1.6 s |
+| 20k-row context, cached: build → query | 10.6 → 0.33 s | 5.1 → 0.15 s | 1.9 → 0.08 s |
+| 100k-row context, cached | OOM | OOM | 16 → 0.11 s (18.8 GB) |
 
-Measured on an L4 against the pinned fixtures (the walk's 374 fits, the 16
-ensemble grids, the density read); deviation is per fit, relative:
+**L4 is the target**; a 48 GB card (L40S, RTX 6000-class) is the later tier.
+A cold container answers after 6–11 s of checkpoint load; keep one warm.
+The container is plain (the `Dockerfile`), with no provider's API in it;
+more than one instance routes by context id, and a miss is only a rebuild.
 
-| | median | 99th pct | worst | coverage flips (of 748) | walk time |
-|---|---|---|---|---|---|
-| fp32 | — | — | 3e-4 | 0 | 16 s |
-| fp16 autocast | 3e-4 | 4.9% | 25% | 2 | 29 s |
-| bf16 autocast | 3e-3 | 41% | 181% | 7 | 30 s |
+## Later, once there is load
 
-So reduced precision is **not** a free switch. The typical fp16 fit is fine
-and one fit in a hundred is percent-level wrong; bf16 is out; and on small
-tables fp16 is also *slower* (autocast's casts outweigh the arithmetic —
-the package's own `auto` heuristic keeps it off below ~1k rows).
+A CPU tier for small reads · grouping reads across tenants · free-threaded
+Python · attribution (each mask is a fresh build, not a cached query) ·
+entity scoring · synthetic twins.
 
-- `graded`: fp32, no cache, the proof of concept's reads — what the fixtures pin. fp32 on
-  the L4 holds them (worst 3e-4, no flips).
-- `fast`: **fp32 for small reads** (walk points, replay grids — exact and
-  faster), and fp16 only where memory forces it: large cached contexts,
-  where the cache is 24 KB a row a member against 48 KB in fp32. Whether
-  fp16's tail exists at that scale is unmeasured — the fixtures are tiny
-  tables with raw, unscaled features. *Before step 2 ships:* the contexts
-  measurement compares the fp16 cached read against the fp32 uncached one
-  on the same panel, and the tolerance is declared from that. If the tail
-  is there too, the L4 runs fp32 caches with fewer members (20k rows × 4
-  members = 3.8 GB) rather than serve a band that is sometimes wrong.
+## Build order
 
-## Deployment
-
-- One plain container (the existing `Dockerfile`); no provider API in the
-  service. Modal for measurement and beta; the SaaS provider (AWS, GCP or
-  Scaleway — undecided) for production. Ask any provider for real 48 GB
-  availability: an L40S queued 33 minutes on Modal.
-- Scale-to-zero costs a 6–11 s first answer: keep one warm instance in
-  business hours, or use a memory snapshot where the platform has one.
-- More than one instance needs **context affinity**: route by context id
-  so a query lands where its cache is; a miss is only a rebuild.
-- Per tenant: queue wait, GPU seconds, cache bytes and hit rate. Payloads
-  are never logged.
-
-## Deliberately later
-
-A CPU tier for small reads · cross-tenant batching · free-threaded Python ·
-a C++ frontend · per-tenant fine-tuning · attribution · entity scoring
-(RelBench is its benchmark) · synthetic twins.
-
-## Build order and what "done" means
-
-1. ~~Tie-aware PIT and the default calibration record~~ — built:
-   `glosskernels.calibration`, `calibration_default.json`.
-2. Contexts door with the soft-state cache, on one GPU owner with the
-   async queue. *Done when:* a 20k-row ensemble builds in ≤ 6 s and a
-   cached query answers in ≤ 0.25 s (p50) on an L4, inside the fast tier's
-   tolerance of the uncached read.
-3. `band_walk` with in-request batching. *Done when:* 100 metrics × 6
-   points answer in ≤ 10 s on an L4 (94 s today) and match `band_point`
-   within tolerance on the pinned walk.
-4. `project` with voices, blend and per-horizon calibration. *Done when*
-   the harness targets hold: at or under the naive floor at every horizon,
-   annual-total coverage within 5 points of 80 (64–72 today — open).
-5. `misfit` per column.
+- [x] Calibration: tie-aware PIT, histogram histories, the default record.
+- [x] `/bands` as the one band route (reads, members, actuals, `pit_history`).
+- [ ] The context cache behind `/bands`, on one GPU owner with the async
+      queue. Done when a 20k-row, 8-member context builds in ≤ 6 s and a
+      cached read answers in ≤ 0.25 s on an L4, within a tolerance of the
+      uncached read declared from the fp16-vs-fp32 measurement.
+- [ ] Reads grouped by shape. Done when 100 metrics × 6 points answer in
+      ≤ 10 s on an L4 and match the pinned fixtures within tolerance.
+- [ ] Voices and `blend` (Chronos-2, seasonal-naive), per-horizon records.
+      Done when the harness holds: at or under the naive floor at every
+      horizon, annual-total coverage within 5 points of 80 (64–72 today).
+- [ ] `/misfit` per column.
+- [ ] glossql moves to this API.
