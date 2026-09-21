@@ -96,17 +96,17 @@ def measure(use_amp: bool = False, misfit_workers: int = 0, context_rows: str = 
 
 
 @app.function(gpu=GPU, cpu=CPU, region=REGION, timeout=1200)
-def parity(use_amp: bool = False) -> dict:
+def parity(use_amp: bool = False, bf16: bool = False) -> dict:
     """The pinned-oracle parity numbers on this GPU (glosskernels.parity)."""
     from glosskernels.parity import run
 
-    return run(Path("/root/fixtures"), use_amp=use_amp)
+    return run(Path("/root/fixtures"), use_amp=use_amp, bf16=bf16)
 
 
 @app.local_entrypoint()
-def main(amp: bool = False, check_parity: bool = False, misfit_workers: int = 0, context_rows: str = ""):
+def main(amp: bool = False, check_parity: bool = False, misfit_workers: int = 0, context_rows: str = "", bf16: bool = False):
     if check_parity:
-        print(parity.remote(use_amp=amp))
+        print(parity.remote(use_amp=amp, bf16=bf16))
         return
     t = time.perf_counter()
     load_cold = probe.remote()
