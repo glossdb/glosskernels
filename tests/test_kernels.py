@@ -50,6 +50,23 @@ def test_band_point_reproduces_the_pinned_walk(k):
     assert flips <= (0 if k.device == "cpu" else 1)
 
 
+def test_the_walk_in_one_call_matches_the_pinned_bands(k):
+    """Points grouped by shape and answered a group a forward pass —
+    batching must not move a band."""
+    walk = np.load(FIXTURES / "bands_walk.npz")
+    pinned = np.load(FIXTURES / "bands_pinned.npz")["bands"]
+    n = int(os.environ.get("GLOSSKERNELS_TEST_FITS", "40"))
+    rtol, atol = _tol(k)
+    reads = [
+        (walk["train_x_all"][off : off + size], walk["train_y_all"][off : off + size], walk["test_x"][i][None, :])
+        for i, (_g, _s, _m, _t, off, size, _id) in enumerate(walk["index"][:n])
+    ]
+    for i, (q, grid) in enumerate(k.bands_many(reads, ALPHAS, members=1)):
+        scale = max(1.0, float(np.abs(pinned[i]).max()))
+        assert np.allclose(q[0], pinned[i], rtol=rtol, atol=atol * scale), f"fit {i}: {q[0]} vs {pinned[i]}"
+        assert grid.shape[0] == 1 and np.all(np.diff(grid[0]) >= 0)
+
+
 def test_band_grid_reproduces_the_ensemble_oracle(k):
     d = np.load(FIXTURES / "e4_walk.npz")
     oracle = np.load(FIXTURES / "e4_ensemble.npz")["grid_bands"]  # (fits, alphas, rows)

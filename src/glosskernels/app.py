@@ -192,8 +192,8 @@ class Bands:
             read_at = calibration.levels(alphas, history, calibration.default_record("tabicl"))
             asked += np.clip(read_at, 0.001, 0.999).tolist()
         answers = []
-        for read in reads:
-            quantiles, grid = k.bands(read["train_x"], read["train_y"], read["test_x"], asked, members)
+        served = k.bands_many([(r["train_x"], r["train_y"], r["test_x"]) for r in reads], asked, members)
+        for read, (quantiles, grid) in zip(reads, served):
             answer = {"quantiles": quantiles[:, : len(alphas)]}
             if history is not None:
                 answer = {"quantiles": np.sort(quantiles[:, len(alphas) :], axis=1), "raw": answer["quantiles"]}

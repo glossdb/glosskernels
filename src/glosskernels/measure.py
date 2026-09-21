@@ -154,6 +154,40 @@ def concurrency(k: Kernels, clients: tuple[int, ...] = (1, 4, 16), calls: int = 
     return out
 
 
+def batching(k: Kernels, sizes: tuple[int, ...] = (1, 8, 64, 256, 1024), rows: int = 24, cols: int = 5) -> list[dict]:
+    """Why a bigger GPU does not speed up a small read, and what does: a
+    walk point's forward pass is a long chain of tiny kernels the host
+    launches one by one, the device idle between them. The model takes a
+    batch of same-shaped tables, so many reads can ride one chain: the
+    forward alone at each batch size, the tables it answers per second,
+    how busy the device is, and how far a table's answer moves when it
+    is batched with others (it should not)."""
+    rng = np.random.default_rng(3)
+    est = k._regressor(n_estimators=1, norm_methods="none", feat_shuffle_method="none", random_state=0)
+    est.fit(rng.normal(size=(rows, cols)), rng.normal(size=rows))
+    config, device = est.inference_config_, est.device_
+    x = torch.from_numpy(rng.normal(size=(max(sizes), rows + 1, cols))).float().to(device)
+    y = torch.from_numpy(rng.normal(size=(max(sizes), rows))).float().to(device)
+    out = []
+    with torch.no_grad():
+        alone = torch.cat([k.model(x[i : i + 1], y[i : i + 1], inference_config=config) for i in range(8)])
+        for b in sizes:
+            k.model(x[:b], y[:b], inference_config=config)  # warm
+            _sync(k)
+            repeats = max(3, 64 // b)
+            with _Utilization(k) as util:
+                t = time.perf_counter()
+                for _ in range(repeats):
+                    got = k.model(x[:b], y[:b], inference_config=config)
+                _sync(k)
+                per = (time.perf_counter() - t) / repeats
+            entry = {"tables": b, "forward_ms": round(per * 1000, 2), "tables_per_s": round(b / per, 1), "gpu_util_pct": util.mean}
+            if b >= 8:
+                entry["max_dev_from_alone"] = float((got[:8] - alone).abs().max())
+            out.append(entry)
+    return out
+
+
 def run(
     panel_rows: int = 5000,
     use_amp: bool = False,

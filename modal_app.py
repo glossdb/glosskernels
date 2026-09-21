@@ -95,18 +95,42 @@ def measure(use_amp: bool = False, misfit_workers: int = 0, context_rows: str = 
     return run(use_amp=use_amp, misfit_workers=misfit_workers or None, context_rows=_rows(context_rows))
 
 
+@app.function(gpu=GPU, cpu=CPU, region=REGION, timeout=900)
+def batching(use_amp: bool = False, flushing_probe: bool = False) -> list:
+    """Small reads riding one forward pass (glosskernels.measure.batching);
+    `flushing_probe` keeps the package's own memory probe, for the comparison."""
+    os.environ["GLOSSKERNELS_FLUSHING_PROBE"] = "1" if flushing_probe else ""
+    from glosskernels.kernels import Kernels
+    from glosskernels.measure import batching as run
+
+    return run(Kernels(use_amp=use_amp))
+
+
 @app.function(gpu=GPU, cpu=CPU, region=REGION, timeout=1200)
-def parity(use_amp: bool = False, bf16: bool = False) -> dict:
+def parity(use_amp: bool = False, bf16: bool = False, flushing_probe: bool = False) -> dict:
     """The pinned-oracle parity numbers on this GPU (glosskernels.parity)."""
+    os.environ["GLOSSKERNELS_FLUSHING_PROBE"] = "1" if flushing_probe else ""
     from glosskernels.parity import run
 
     return run(Path("/root/fixtures"), use_amp=use_amp, bf16=bf16)
 
 
 @app.local_entrypoint()
-def main(amp: bool = False, check_parity: bool = False, misfit_workers: int = 0, context_rows: str = "", bf16: bool = False):
+def main(
+    amp: bool = False,
+    check_parity: bool = False,
+    misfit_workers: int = 0,
+    context_rows: str = "",
+    bf16: bool = False,
+    check_batching: bool = False,
+    flushing_probe: bool = False,
+):
+    if check_batching:
+        for row in batching.remote(use_amp=amp, flushing_probe=flushing_probe):
+            print(row)
+        return
     if check_parity:
-        print(parity.remote(use_amp=amp, bf16=bf16))
+        print(parity.remote(use_amp=amp, bf16=bf16, flushing_probe=flushing_probe))
         return
     t = time.perf_counter()
     load_cold = probe.remote()

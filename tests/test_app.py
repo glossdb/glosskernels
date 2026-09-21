@@ -13,10 +13,12 @@ from glosskernels import kernels
 class Fake:
     device = "fake"
 
-    def bands(self, train_x, train_y, test_x, alphas, members):
+    def bands_many(self, reads, alphas, members):
         # Each quantile is its own level plus the member count; the grid is 1..9.
-        q = np.tile(np.asarray(alphas) + members, (test_x.shape[0], 1))
-        return q, np.tile(np.arange(1.0, 10.0), (test_x.shape[0], 1))
+        return [
+            (np.tile(np.asarray(alphas) + members, (test_x.shape[0], 1)), np.tile(np.arange(1.0, 10.0), (test_x.shape[0], 1)))
+            for _train_x, _train_y, test_x in reads
+        ]
 
     def misfit(self, x):
         return np.array([0.1, float("nan")])

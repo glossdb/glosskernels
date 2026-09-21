@@ -113,19 +113,43 @@ reuses it. Build once (5 s at 20k rows on an L4), then 0.15 s per query.
 - Projections keep a record per horizon; a what-if is calibrated from the
   factual reads of the same context (measured: as narrow as its what-ifs).
 
-## Sharing the device
+## Keeping the device busy
 
-- Requests are parsed on the event loop's thread pool and queued; **one
-  worker owns the GPU**, handlers `await` it. The host prepares the next
-  job while the GPU runs this one.
-- Short reads are bound by the host launching kernels, not by waiting
-  (GPU 6–13% busy): the remedy is many reads per request, grouped by shape
-  into one forward pass — 100 metrics × 6 points is ~94 s one at a time on
-  an L4.
+A small read does not use a GPU, however big: its forward pass is a long
+chain of tiny kernels the host launches one by one — 35 ms for one
+walk-sized table on an L4 that is 10% busy, and no faster on a bigger
+card. What fills the device is tables of one shape riding the same chain:
+
+| tables in one pass (L4, fp32, 24×5) | 1 | 8 | 64 | 256 | 1024 |
+|---|---|---|---|---|---|
+| tables per second | 28 | 221 | 799 | 877 | 831 |
+| GPU busy | 9% | 15% | 67% | 99% | 99% |
+
+So `/bands` prepares every read of a request, groups their tables by shape
+(a read has one table per member), and answers a group per pass. With the
+passes batched, what a walk waits on is the host preparing reads — the
+package's own preprocessing, a few ms a read — so that runs in a pool of
+processes beside the model. The pinned walk's 374 points on an L4: **19.1 s
+one at a time, 1.31 s in one request** (0.41 s preparing on three workers,
+0.76 s on the GPU), the same distance from the fixtures either way (worst
+3e-4, no coverage flips). Batching moves an answer by ~1e-5.
+
+Also measured: the package synchronizes the device and empties PyTorch's
+allocator cache to read free memory, three times a pass; the kernel reads
+the same number without the flush (8 tables: 46 → 36 ms).
+
+- **One owner per GPU, fed by a queue; handlers `await` it.** The owner
+  takes whatever is waiting — reads from every request in the queue — and
+  groups them together, so under load the passes fill on their own and an
+  idle service answers at once. No batching window, no added latency.
+  Riding with another tenant's tables moves a number by float noise
+  (~1e-5, against a fixture tolerance of 2e-3); nothing of one tenant's
+  data is visible to another.
 - Round-robin across tenants, short jobs ahead of long builds; past a queue
   depth, `429` with `Retry-After`.
-- Reads are grouped within a request only, so one tenant's load never
-  changes another's numbers.
+- Threads do not share the device (no lock: same numbers, half the
+  throughput on an L4). Hosts with more cores prepare more reads at once;
+  past one process's reach, more processes per GPU (MPS).
 - Precision is the service's business, not the caller's: fp32 for small
   reads (exact, and faster — 16 s against 29 s for the pinned walk), fp16
   only for large cached contexts and only once its deviation there is
@@ -156,12 +180,15 @@ entity scoring · synthetic twins.
 
 - [x] Calibration: tie-aware PIT, histogram histories, the default record.
 - [x] `/bands` as the one band route (reads, members, actuals, `pit_history`).
-- [ ] The context cache behind `/bands`, on one GPU owner with the async
-      queue. Done when a 20k-row, 8-member context builds in ≤ 6 s and a
+- [ ] The context cache behind `/bands`. Done when a 20k-row, 8-member context builds in ≤ 6 s and a
       cached read answers in ≤ 0.25 s on an L4, within a tolerance of the
       uncached read declared from the fp16-vs-fp32 measurement.
-- [ ] Reads grouped by shape. Done when 100 metrics × 6 points answer in
-      ≤ 10 s on an L4 and match the pinned fixtures within tolerance.
+- [x] Reads grouped by shape, prepared in a process pool: the pinned walk's
+      374 points in 1.31 s on an L4 (19.1 s one at a time), fixtures held.
+- [ ] One GPU owner behind an async queue, grouping reads across the
+      requests that are waiting. Done when 16 callers sending small walks
+      at once keep an L4 over 80% busy and none waits behind another's
+      long build.
 - [ ] Voices and `blend` (Chronos-2, seasonal-naive), per-horizon records.
       Done when the harness holds: at or under the naive floor at every
       horizon, annual-total coverage within 5 points of 80 (64–72 today).

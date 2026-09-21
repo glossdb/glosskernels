@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from typing import Any
 
 import numpy as np
@@ -30,8 +31,16 @@ import torch
 from huggingface_hub import hf_hub_download
 from tabicl import TabICLRegressor, TabICLUnsupervised
 
+from .prepare import prepare_many, warm
+
 HUB_REPO = "jingang/TabICL"
 REGRESSOR = "tabicl-regressor-v2-20260212.ckpt"
+
+
+# Tables of one shape a forward pass carries: an L4 is saturated at ~256
+# walk-sized tables, and a pass is kept under a cell budget as tables grow.
+_TABLES_PER_PASS = 256
+_CELLS_PER_PASS = 4_000_000
 
 
 class KernelError(Exception):
@@ -53,6 +62,39 @@ def pick_device() -> str:
     if torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+
+def _free_without_flushing(manager) -> float:
+    """What the package's probe answers, without what it does to get it.
+
+    Before every forward pass (three times a pass: columns, rows, the
+    ICL stack) the package sizes its batches from free device memory, and
+    to read that it synchronizes the device and empties PyTorch's
+    allocator cache — so every pass waits for the device, then buys its
+    memory back from the driver. For a walk-sized table that is most of
+    the pass. The same number is there without the flush: what the
+    driver has free, plus what the allocator holds and is not using."""
+    device = manager.exe_device
+    free, _total = torch.cuda.mem_get_info(device)
+    idle = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+    return (free + idle) / (1024 * 1024)
+
+
+def _probe_memory_cheaply() -> None:
+    from tabicl._model.inference import InferenceManager
+
+    flushing = InferenceManager.get_available_gpu_memory
+
+    def available(self) -> float:
+        if getattr(self.exe_device, "type", None) == "cuda":
+            return _free_without_flushing(self)
+        return flushing(self)
+
+    InferenceManager.get_available_gpu_memory = available
+
+
+if os.environ.get("GLOSSKERNELS_FLUSHING_PROBE", "") != "1":  # the package's own, for a comparison
+    _probe_memory_cheaply()
 
 
 class _Regressor(TabICLRegressor):
@@ -94,46 +136,121 @@ class Kernels:
 
     # -- the reads --------------------------------------------------------
 
-    def bands(
+    def bands(self, train_x, train_y, test_x, alphas, members: int = 1) -> tuple[np.ndarray, np.ndarray]:
+        """One read: quantiles (test rows x alphas) and the raw quantile
+        grid (test rows x grid) for `test_x` given the context rows."""
+        return self.bands_many([(train_x, train_y, test_x)], alphas, members)[0]
+
+    def bands_many(
         self,
-        train_x: np.ndarray,
-        train_y: np.ndarray,
-        test_x: np.ndarray,
+        reads: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
         alphas: list[float],
         members: int = 1,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Quantiles (test rows x alphas) and the raw quantile grid (test
-        rows x grid) for `test_x` given the context rows. One member is
-        the pinned one (no normalization, no feature shuffle); more is
-        the package's ensemble of that size."""
-        rows, cols = train_x.shape
-        if rows < 2 or train_y.shape[0] != rows or test_x.ndim != 2 or test_x.shape[1] != cols:
-            raise KernelError(
-                f"bands: {rows} train rows x {cols} features against {train_y.shape[0]} train values "
-                f"and test rows of shape {test_x.shape}"
-            )
-        # The package's preprocessor drops constant columns (mean-imputed
-        # first) and its member generator fails on an empty set with a
-        # message about sequences; say what happened instead.
-        imputed = np.where(np.isnan(train_x), np.nanmean(train_x, axis=0), train_x)
-        if members > 1 and not np.any(imputed != imputed[0], axis=0).any():
-            raise KernelError(
-                "bands: every feature column is constant over the training rows — nothing varies to band on"
-            )
-        if members == 1:
-            est = self._regressor(n_estimators=1, norm_methods="none", feat_shuffle_method="none", random_state=0)
-        else:
-            est = self._regressor(n_estimators=members, random_state=0)
-        try:
-            est.fit(train_x, train_y)
-            out = est.predict(test_x, output_type=["quantiles", "raw_quantiles"], alphas=alphas)
-        except Exception as e:  # the package's own refusals, by their text
-            raise KernelError(f"bands: {e}") from e
-        n = test_x.shape[0]
-        return (
-            np.asarray(out["quantiles"], dtype=np.float64).reshape(n, len(alphas)),
-            np.asarray(out["raw_quantiles"], dtype=np.float64).reshape(n, -1),
-        )
+        timings: dict | None = None,
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        """Many reads, the device kept busy. One member is the pinned one
+        (no normalization, no feature shuffle); more is the package's
+        ensemble of that size.
+
+        A small read's forward pass is a long chain of tiny kernels the
+        host launches one by one — 35 ms on an L4 that is 10% busy, and
+        no faster on a bigger card. The model takes a batch of tables of
+        one shape, so the reads' tables (a read has one per member) are
+        prepared as the package prepares them, grouped by shape, and each
+        group rides one chain: 814 tables a second on the same L4, the
+        answers within 2e-5 of one at a time. What comes back is rescaled
+        and averaged per read exactly as the package's `predict` does.
+        `timings`, when given, is filled with where the seconds went."""
+        clock = [time.perf_counter()]
+
+        def lap(name: str) -> None:
+            if timings is not None:
+                if self.device == "cuda":
+                    torch.cuda.synchronize()
+                now = time.perf_counter()
+                timings[name] = round(timings.get(name, 0.0) + now - clock[0], 3)
+                clock[0] = now
+
+        for index, (train_x, train_y, test_x) in enumerate(reads):
+            rows, cols = train_x.shape
+            if rows < 2 or train_y.shape[0] != rows or test_x.ndim != 2 or test_x.shape[1] != cols:
+                raise KernelError(
+                    f"bands: read {index}: {rows} train rows x {cols} features against "
+                    f"{train_y.shape[0]} train values and test rows of shape {test_x.shape}"
+                )
+            # The package's preprocessor drops constant columns (mean-imputed
+            # first) and its member generator fails on an empty set with a
+            # message about sequences; say what happened instead.
+            imputed = np.where(np.isnan(train_x), np.nanmean(train_x, axis=0), train_x)
+            if members > 1 and not np.any(imputed != imputed[0], axis=0).any():
+                raise KernelError(
+                    f"bands: read {index}: every feature column is constant over the training rows — "
+                    "nothing varies to band on"
+                )
+        scalers, tables = [], []  # tables: (read, Xs member-major, ys)
+        for index, made in enumerate(prepare_many(reads, members)):
+            if isinstance(made, str):
+                raise KernelError(f"bands: read {index}: {made}")
+            scalers.append(made[1])
+            tables.extend((index, xs, ys) for xs, ys in made[0])
+        lap("prepare_s")
+        groups: dict[tuple, list[int]] = {}
+        for at, (_index, xs, ys) in enumerate(tables):
+            groups.setdefault((xs.shape[1:], ys.shape[1:]), []).append(at)
+        answered: list[dict[str, np.ndarray] | None] = [None] * len(tables)
+        kinds = ["quantiles", "raw_quantiles"]
+        for (x_shape, _), members_of in groups.items():
+            # As many tables a pass as saturate the device, fewer as they grow.
+            per_pass = max(1, min(_TABLES_PER_PASS, _CELLS_PER_PASS // int(np.prod(x_shape))))
+            device, config = self._configured(x_shape[0])
+            spans = np.cumsum([0] + [tables[at][1].shape[0] for at in members_of])
+            xs = np.concatenate([tables[at][1] for at in members_of])
+            ys = np.concatenate([tables[at][2] for at in members_of])
+            outs = {kind: [] for kind in kinds}
+            try:
+                with torch.no_grad():
+                    for lo in range(0, xs.shape[0], per_pass):
+                        out = self.model.predict_stats(
+                            torch.from_numpy(xs[lo : lo + per_pass]).float().to(device),
+                            torch.from_numpy(ys[lo : lo + per_pass]).float().to(device),
+                            output_type=kinds,
+                            alphas=alphas,
+                            inference_config=config,
+                        )
+                        for kind in kinds:
+                            outs[kind].append(out[kind].float().cpu().numpy())
+            except Exception as e:
+                raise KernelError(f"bands: {e}") from e
+            whole = {kind: np.concatenate(parts) for kind, parts in outs.items()}
+            for slot, at in enumerate(members_of):
+                answered[at] = {kind: whole[kind][spans[slot] : spans[slot + 1]] for kind in kinds}
+
+        lap("forward_s")
+        if timings is not None:
+            timings["tables"], timings["shapes"] = len(tables), len(groups)
+        results = []
+        mine_of: dict[int, list] = {}
+        for at, table in enumerate(tables):
+            mine_of.setdefault(table[0], []).append(answered[at])
+        for index, y_scaler in enumerate(scalers):
+            mine = mine_of[index]
+            pair = []
+            for kind in kinds:
+                arr = np.concatenate([m[kind] for m in mine])  # (members, test rows, quantiles)
+                scaled = y_scaler.inverse_transform(arr.reshape(-1, 1)).reshape(arr.shape)
+                pair.append(np.mean(scaled, axis=0).astype(np.float64))
+            results.append((pair[0], pair[1]))
+        lap("finish_s")
+        return results
+
+    def _configured(self, rows: int):
+        """The device and inference configuration the package would build
+        for a table of `rows` — its own code, without the fit around it."""
+        est = self._regressor()
+        est._resolve_device()
+        est.n_samples_in_ = rows
+        est._build_inference_config()
+        return est.device_, est.inference_config_
 
     def band_point(self, train_x, train_y, test_x, alphas, actual) -> tuple[list[float], float]:
         """The walk point as the fixtures pin it: the pinned member, and
@@ -268,6 +385,7 @@ def get() -> Kernels:
     with _LOCK:
         if _KERNELS is None:
             _KERNELS = Kernels()
+            threading.Thread(target=warm, daemon=True).start()
         return _KERNELS
 
 

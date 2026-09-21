@@ -71,6 +71,26 @@ def run(fixtures: Path, use_amp: bool = False, bf16: bool = False) -> dict:
         "s": round(time.perf_counter() - t, 1),
     }
 
+    # The same walk as one call: every point prepared, grouped by shape,
+    # each group one forward pass — what `/bands` does with a walk.
+    t = time.perf_counter()
+    reads = [
+        (walk["train_x_all"][off : off + size], walk["train_y_all"][off : off + size], walk["test_x"][i][None, :])
+        for i, (_g, _s, _m, _t, off, size, _id) in enumerate(walk["index"])
+    ]
+    together = k.bands_many(reads, ALPHAS, members=1)
+    out["walk_together"] = {
+        **_spread([_rel(q[0], pinned[i]) for i, (q, _grid) in enumerate(together)]),
+        "shapes": len({r[0].shape for r in reads}),
+        "s": round(time.perf_counter() - t, 1),
+    }
+    # Again, the shapes now seen: what a warm service pays.
+    t = time.perf_counter()
+    where: dict = {}
+    k.bands_many(reads, ALPHAS, members=1, timings=where)
+    out["walk_together"]["s_warm"] = round(time.perf_counter() - t, 2)
+    out["walk_together"]["where"] = where
+
     d = np.load(fixtures / "e4_walk.npz")
     oracle = np.load(fixtures / "e4_ensemble.npz")["grid_bands"]
     devs = []
