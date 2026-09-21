@@ -1,16 +1,26 @@
-# glosskernels v2 — the shared instance
+# glosskernels — the first deployment
 
-Status: draft for review, 2026-09-21. Nothing here is built yet. The v1
-doors (`band_point`, `band_grid`, `misfit`) stay exactly as they are: they
-are the graded reference, and every fast path below is held to them.
+Status: design agreed 2026-09-21; nothing here is built yet. What exists
+today is a proof of concept: three doors (`band_point`, `band_grid`,
+`misfit`) over the reference package, never deployed. Its reads stay as
+the graded reference — every fast path below is held to them — and glossql
+changes only once this is done.
 
-## What v2 is for
+## What it is for
 
 One kernel service on one GPU, shared by every tenant of the SaaS, serving
 the three reads the product leans on — **bands, what-if, projections** —
-at cube scale. v1 cannot do that for three measured reasons: every call
+at cube scale. The proof of concept cannot do that for three measured reasons: every call
 refits its context, one lock serializes every caller, and a walk is
 hundreds of round trips of tiny tables.
+
+**What belongs in this service, and what does not.** It is shared by every
+tenant, so it carries only what needs the model, and the statistics that
+read the model's own output — calibration and blending happen here and
+nowhere else. Everything the caller can do stays with the caller:
+assembling contexts, building feature rows (glossql's walk recipe stays
+where it is), aggregating PIT histories. A request is numbers and a key,
+as it is today.
 
 This repo stays open (Apache-2.0). It wraps open models; there is nothing
 secret in it. What is private is deployment — keys, the key→tenant map,
@@ -82,12 +92,12 @@ JSON parse alone is seconds of host time.
 
 | door | body | answer |
 |---|---|---|
-| `PUT /v2/contexts` | `train_x`, `train_y`, `protocol` (`pinned` \| `ensemble`), `members`, `tier` (`graded` \| `fast`) | `context` (the hash), `rows`, `cols`, `cache_mb`, `build_s` — idempotent |
-| `POST /v2/contexts/{id}/quantiles` | `test_x`, `alphas` or `grid: true`, `pit_history` (optional) | `quantiles` raw, `calibrated`, `support` per row |
-| `DELETE /v2/contexts/{id}` | | |
-| `POST /v2/band_walk` | many walk points in one request (below), `voices`, `pit_history` | per voice: `quantiles`, `pit`; plus `blend` and `calibrated` |
-| `POST /v2/project` | series (`values`, `periods`), `horizons`, `alphas`, `voices`, `pit_history` per horizon | per voice and horizon: `quantiles`; `blend`, `calibrated`; `total` when asked |
-| `POST /v2/misfit` | `x`, `columns: true` | `scores` per row, and per row × column — which cell made the row improbable |
+| `PUT /v1/contexts` | `train_x`, `train_y`, `protocol` (`pinned` \| `ensemble`), `members`, `tier` (`graded` \| `fast`) | `context` (the hash), `rows`, `cols`, `cache_mb`, `build_s` — idempotent |
+| `POST /v1/contexts/{id}/quantiles` | `test_x`, `alphas` or `grid: true`, `pit_history` (optional) | `quantiles` raw, `calibrated`, `support` per row |
+| `DELETE /v1/contexts/{id}` | | |
+| `POST /v1/band_walk` | many walk points in one request (below), `voices`, `pit_history` | per voice: `quantiles`, `pit`; plus `blend` and `calibrated` |
+| `POST /v1/project` | per horizon the caller's feature rows, plus `history` (the series, for the voices that read one), `alphas`, `voices`, `pit_history` per horizon | per voice and horizon: `quantiles`; `blend`, `calibrated`; `total` when asked |
+| `POST /v1/misfit` | `x`, `columns: true` | `scores` per row, and per row × column — which cell made the row improbable |
 
 - **What-if is the contexts door.** glossql assembles the panel (with the
   attributes that place a lever against its usual level — the harness
@@ -95,9 +105,9 @@ JSON parse alone is seconds of host time.
   member's rows with the lever moved. `support` says, per query row,
   whether each feature lies inside what the context has seen: the read is
   honest inside (median 0.06 of truth off against replay's 0.15) and must
-  be flagged outside. v1's replay-grid `band_grid` stays as it is.
+  be flagged outside. The replay-grid `band_grid` stays as it is.
 - **`band_walk`** exists to end the round trips: 100 metrics × 6 points is
-  600 v1 calls, ~94 s on an L4 today. One request lets the kernel group
+  600 `band_point` calls, ~94 s on an L4 today. One request lets the kernel group
   the points that share a shape into one forward pass (the model takes a
   batch of same-shaped tables). *To verify:* the batched path must
   reproduce `band_point` within the fast tier's tolerance on the pinned
@@ -110,20 +120,8 @@ JSON parse alone is seconds of host time.
   or under the naive floor at every horizon on both panels).
 - **Annual totals** are asked for as their own series (`total: 12`), never
   summed from monthly bands — summed bands covered 94–99% at a nominal 80.
-- **Attribution is not in v2.0.** Masking a column changes the context, so
+- **Attribution is not in the first deployment.** Masking a column changes the context, so
   each mask is a fresh build, not a cached query; it needs its own costing.
-
-### Who owns the feature recipe — a decision to make
-
-In v1 glossql builds the walk's feature rows (index, month, lags, the
-median fill) and the kernel sees only numbers. For v2 I propose the kernel
-owns recipes for `band_walk` and `project`: requests carry **series**
-(values and periods — still only numbers and a key), and the rows are
-built here. The reason is the boundary rule: a recipe is a statistical
-choice, and the harness already showed recipes matter and change (the
-pooled index flaw, the seasonal recipe that did not earn its place). Kept
-in Rust in glossql, every such change is a change in two repos, graded in
-neither. v1 keeps rows-in, unchanged.
 
 ## Calibration
 
@@ -144,10 +142,11 @@ history.
 - No tenant's PITs ever reach another tenant. The default comes from
   public data only.
 - PITs are always taken against the **raw** answer.
-- **Before the v2 wire freezes: a tie-aware PIT.** On a mostly-zero metric
+- **Before the wire is fixed: a tie-aware PIT.** On a mostly-zero metric
   (car_parts) the current PIT counts every tied quantile as "under", and
-  calibrating on it made honest bands too wide. The v2 PIT places an actual
-  tied with k grid points at the middle of the tie. v1's PIT is unchanged.
+  calibrating on it made honest bands too wide. The new PIT places a tied
+  actual uniformly within its tie, the draw derived from the request so a
+  replay repeats it. `band_point` moves to it when glossql changes.
 
 ## Sharing the device
 
@@ -189,7 +188,7 @@ and one fit in a hundred is percent-level wrong; bf16 is out; and on small
 tables fp16 is also *slower* (autocast's casts outweigh the arithmetic —
 the package's own `auto` heuristic keeps it off below ~1k rows).
 
-- `graded`: fp32, no cache, v1 semantics — what the fixtures pin. fp32 on
+- `graded`: fp32, no cache, the proof of concept's reads — what the fixtures pin. fp32 on
   the L4 holds them (worst 3e-4, no flips).
 - `fast`: **fp32 for small reads** (walk points, replay grids — exact and
   faster), and fp16 only where memory forces it: large cached contexts,
