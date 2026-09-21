@@ -22,6 +22,12 @@ glosskernels = "glosskernels.__main__:main"
 
 [dependency-groups]
 dev = ["pytest>=9", "httpx>=0.28", "modal>=1.5"]
+harness = [
+    "chronos-forecasting>=2",
+    "pandas>=2.2",
+    "pyarrow>=17",
+    "synthefy-nori>=0.16.0",
+]
 
 [build-system]
 requires = ["hatchling"]

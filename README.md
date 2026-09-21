@@ -58,6 +58,32 @@ hold the reads to the port repo's pinned oracle fixtures.
 - A container (`Dockerfile`): the same process on whatever GPU the
   host has, CPU without one.
 
+## The harness
+
+What decides which voice is served: every voice walked one step ahead
+over public monthly panels and scored as the witness plane scores a
+band — quantile loss on the door's five alphas, 80/90 coverage, width,
+and the PITs' distance from uniform.
+
+```bash
+uv sync --group harness                # pandas, pyarrow, chronos-forecasting, synthefy-nori
+uv run python -m glosskernels.harness --panel tourism_monthly --series 60
+uv run python -m glosskernels.harness --panel hospital --voices seasonal_naive,walk:tabicl,chronos2
+```
+
+| voice | the context | the model |
+|---|---|---|
+| `seasonal_naive` | the series' own year-over-year moves | none — the floor |
+| `walk:tabicl` | one series' months, the walk's graded recipe | the pinned member (`band_point`) |
+| `pooled:tabicl` | the panel's recent rows, each series in its own units | the default ensemble (`band_grid`) |
+| `walk:nori`, `pooled:nori` | the same two contexts | Synthefy Nori (Apache-2.0) |
+| `chronos2` | each series alone, as a series | Chronos-2 (Apache-2.0) |
+
+Panels: `tourism_monthly`, `hospital`, `car_parts` (the Monash archive
+from the hub) and `synthetic` (no network). Nori wants torch
+under 2.14, and uv resolves every group into one lock, so the `harness`
+group holds the whole lock at 2.13; the parity tests pass on 2.13 and 2.14.
+
 ## Tests
 
 ```bash
