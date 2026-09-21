@@ -20,6 +20,7 @@ GLOSSKERNELS_KEYS=k1 uv run glosskernels   # a bearer per caller
 | `GLOSSKERNELS_DEVICE` | `cuda`, `mps` or `cpu`; default the first available in that order |
 | `GLOSSKERNELS_KEYS` | comma-separated bearer keys; unset serves open (a laptop, or a host that authenticates in front) |
 | `GLOSSKERNELS_QUEUE_MB` | what may wait for the GPU, in MB of reads; default 512, half of it at most one caller's — past it a `429` with `Retry-After` |
+| `GLOSSKERNELS_CACHE_MB` | device memory for kept contexts; default two fifths of the GPU (2 GB without one), half of it at most one caller's |
 | `GLOSSKERNELS_MAX_BODY_MB` | the largest body parsed; default 256 — past it a `413` |
 | `GLOSSKERNELS_PREPARE_WORKERS` | processes preparing reads beside the model; default the cores but one, at most 8 |
 | `HF_HUB_OFFLINE` | `1` in the image: the checkpoint is baked, nothing is fetched at start |
@@ -36,7 +37,7 @@ by name.
 
 | route | body | answer |
 |---|---|---|
-| `POST /bands` | `alphas`, `reads` (each `train_x`, `train_y`, `test_x` rows × cols, and optionally `actual` and `salt` per test row), `members`, `pit_history` | per read: `quantiles` (rows × alphas), `pit` where an actual was given, `raw` when a `pit_history` was |
+| `POST /bands` | `alphas`, `reads` (each `train_x`, `train_y`, `test_x` rows × cols — or `context` in place of the train rows — and optionally `actual` and `salt` per test row, `cache`), `members`, `pit_history` | per read: `quantiles` (rows × alphas), `pit` where an actual was given, `raw` when a `pit_history` was, `context` when kept |
 | `POST /misfit` | `x` (rows × cols) | `scores` (per row; log density, higher fits the frame better) |
 | `GET /healthz` | | `status`, `device`, `loaded` |
 
