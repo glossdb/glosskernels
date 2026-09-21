@@ -19,6 +19,9 @@ GLOSSKERNELS_KEYS=k1 uv run glosskernels   # a bearer per caller
 | `GLOSSKERNELS_ADDR` | where to listen; default `127.0.0.1:8100` |
 | `GLOSSKERNELS_DEVICE` | `cuda`, `mps` or `cpu`; default the first available in that order |
 | `GLOSSKERNELS_KEYS` | comma-separated bearer keys; unset serves open (a laptop, or a host that authenticates in front) |
+| `GLOSSKERNELS_QUEUE_MB` | what may wait for the GPU, in MB of reads; default 512, half of it at most one caller's — past it a `429` with `Retry-After` |
+| `GLOSSKERNELS_MAX_BODY_MB` | the largest body parsed; default 256 — past it a `413` |
+| `GLOSSKERNELS_PREPARE_WORKERS` | processes preparing reads beside the model; default the cores but one, at most 8 |
 | `HF_HUB_OFFLINE` | `1` in the image: the checkpoint is baked, nothing is fetched at start |
 
 The checkpoint comes from the Hugging Face hub cache (`jingang/TabICL`,

@@ -102,8 +102,10 @@ def batching(use_amp: bool = False, flushing_probe: bool = False) -> list:
     os.environ["GLOSSKERNELS_FLUSHING_PROBE"] = "1" if flushing_probe else ""
     from glosskernels.kernels import Kernels
     from glosskernels.measure import batching as run
+    from glosskernels.measure import callers
 
-    return run(Kernels(use_amp=use_amp))
+    k = Kernels(use_amp=use_amp)
+    return [*run(k), callers(k)]
 
 
 @app.function(gpu=GPU, cpu=CPU, region=REGION, timeout=1200)

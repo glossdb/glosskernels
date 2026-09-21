@@ -12,6 +12,7 @@ authenticates in front — Modal's proxy auth). Same header either way.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
@@ -26,10 +27,23 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from . import calibration, kernels
+from .owner import Busy, Owner, TooLarge
 
-# One model on one device answers one call at a time: the reads are
-# short, and the accelerators do not share a device across threads.
-_LOCK = threading.Lock()
+# Handlers never touch the model: one owner per device takes what is
+# waiting from every caller and answers it together (owner.py).
+_OWNER: Owner | None = None
+_OWNER_LOCK = threading.Lock()
+
+# A body is parsed before the queue can refuse it, so it is bounded first.
+MAX_BODY_MB = int(os.environ.get("GLOSSKERNELS_MAX_BODY_MB", "") or 256)
+
+
+def owner() -> Owner:
+    global _OWNER
+    with _OWNER_LOCK:
+        if _OWNER is None:
+            _OWNER = Owner(lambda: kernels.get())
+        return _OWNER
 
 
 class Refusal(Exception):
@@ -45,13 +59,15 @@ def _keys() -> set[str]:
     return {k.strip() for k in raw.split(",") if k.strip()}
 
 
-def _authorized(request: Request) -> bool:
+def _caller(request: Request) -> str | None:
+    """Who is asking — the bearer key, which is also whose share of the
+    queue the request counts against; None when the key is not one of ours."""
     keys = _keys()
-    if not keys:
-        return True
     header = request.headers.get("authorization", "")
     scheme, _, token = header.partition(" ")
-    return scheme.lower() == "bearer" and token.strip() in keys
+    if not keys:
+        return "open"
+    return token.strip() if scheme.lower() == "bearer" and token.strip() in keys else None
 
 
 def _matrix(body: dict[str, Any], name: str, *, ndim: int) -> np.ndarray:
@@ -114,8 +130,14 @@ class _Answer(Response):
 
 
 async def _body(request: Request) -> dict[str, Any]:
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > MAX_BODY_MB * 1024 * 1024:
+        raise Refusal(f"the body is over {MAX_BODY_MB} MB — send the reads in parts", 413)
+    raw = await request.body()
+    if len(raw) > MAX_BODY_MB * 1024 * 1024:
+        raise Refusal(f"the body is over {MAX_BODY_MB} MB — send the reads in parts", 413)
     try:
-        body = await request.json()
+        body = await run_in_threadpool(json.loads, raw)
     except json.JSONDecodeError as e:
         raise Refusal(f"the body is not JSON: {e}", 400)
     if not isinstance(body, dict):
@@ -124,23 +146,22 @@ async def _body(request: Request) -> dict[str, Any]:
 
 
 def _door(read):
-    """Wrap a read: auth, body, the kernel under the lock, errors as JSON."""
+    """Wrap a read: auth, body, the owner's queue, errors as JSON."""
 
     async def endpoint(request: Request) -> Response:
-        if not _authorized(request):
+        caller = _caller(request)
+        if caller is None:
             return JSONResponse({"error": "unauthorized: a bearer key this service issued"}, status_code=401)
         try:
             body = await _body(request)
-            args = read.parse(body)
-
-            def run():
-                with _LOCK:
-                    return read.serve(kernels.get(), **args)
-
-            result = await run_in_threadpool(run)
-            return _Answer(result)
+            args = await run_in_threadpool(read.parse, body)
+            return _Answer(await read.serve(owner(), caller, **args))
         except Refusal as e:
             return JSONResponse({"error": str(e)}, status_code=e.status)
+        except Busy as e:
+            return JSONResponse({"error": str(e)}, status_code=429, headers={"Retry-After": str(e.retry_after)})
+        except TooLarge as e:
+            return JSONResponse({"error": str(e)}, status_code=413)
         except kernels.KernelError as e:
             return JSONResponse({"error": str(e)}, status_code=422)
 
@@ -186,13 +207,14 @@ class Bands:
         return {"reads": parsed, "alphas": _alphas(body), "members": members, "history": history}
 
     @staticmethod
-    def serve(k: kernels.Kernels, reads, alphas, members, history):
+    async def serve(own: Owner, caller: str, reads, alphas, members, history):
         asked = list(alphas)
         if history is not None:
             read_at = calibration.levels(alphas, history, calibration.default_record("tabicl"))
             asked += np.clip(read_at, 0.001, 0.999).tolist()
         answers = []
-        served = k.bands_many([(r["train_x"], r["train_y"], r["test_x"]) for r in reads], asked, members)
+        waiting = own.bands(caller, [(r["train_x"], r["train_y"], r["test_x"]) for r in reads], asked, members)
+        served = await asyncio.wrap_future(waiting)
         for read, (quantiles, grid) in zip(reads, served):
             answer = {"quantiles": quantiles[:, : len(alphas)]}
             if history is not None:
@@ -215,8 +237,10 @@ class Misfit:
         return {"x": _matrix(body, "x", ndim=2)}
 
     @staticmethod
-    def serve(k: kernels.Kernels, **a):
-        return {"scores": k.misfit(**a)}
+    async def serve(own: Owner, caller: str, x):
+        # The chain rule fits a conditional per column per ordering: the frame, that many times.
+        waiting = own.exclusive(caller, "misfit", 2 * x.shape[1] * x.size, lambda k: k.misfit(x))
+        return {"scores": await asyncio.wrap_future(waiting)}
 
 
 async def healthz(_: Request) -> Response:

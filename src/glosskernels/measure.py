@@ -188,6 +188,63 @@ def batching(k: Kernels, sizes: tuple[int, ...] = (1, 8, 64, 256, 1024), rows: i
     return out
 
 
+def callers(k: Kernels, clients: int = 16, requests: int = 8, points: int = 6) -> dict:
+    """Many callers, small walks: `clients` threads each send `requests`
+    walks of `points` reads (a metric's six months, the context growing a
+    row a month). One after another, as a service answering a request at
+    a time would; then through the owner's queue, where what is waiting
+    rides together."""
+    from .owner import Owner
+
+    rng = np.random.default_rng(4)
+
+    def walk():
+        return [(rng.normal(size=(18 + m, 5)), rng.normal(size=18 + m), rng.normal(size=(1, 5))) for m in range(points)]
+
+    work = [[walk() for _ in range(requests)] for _ in range(clients)]
+    total = clients * requests * points
+    from .prepare import warm
+
+    warm()  # the pool's start is a service's start, not a request's
+    k.bands_many([read for reads in work[0] for read in reads] * 2, ALPHAS)  # and the shapes, batched
+    out: dict = {"clients": clients, "requests_each": requests, "reads": total}
+
+    with _Utilization(k) as util:
+        t = time.perf_counter()
+        for mine in work:
+            for reads in mine:
+                k.bands_many(reads, ALPHAS)
+        _sync(k)
+        took = time.perf_counter() - t
+    out["one_request_at_a_time"] = {"s": round(took, 2), "reads_per_s": round(total / took, 1), "gpu_util_pct": util.mean}
+
+    own = Owner(lambda: k)
+
+    def client(i: int) -> float:
+        worst = 0.0
+        for reads in work[i]:
+            t0 = time.perf_counter()
+            own.bands(f"caller-{i}", reads, ALPHAS, 1).result()
+            worst = max(worst, time.perf_counter() - t0)
+        return worst
+
+    with _Utilization(k) as util:
+        t = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=clients) as pool:
+            slowest = max(pool.map(client, range(clients)))
+        _sync(k)
+        took = time.perf_counter() - t
+    out["through_the_owner"] = {
+        "s": round(took, 2),
+        "reads_per_s": round(total / took, 1),
+        "gpu_util_pct": util.mean,
+        "slowest_request_s": round(slowest, 3),
+        "cycles": own.stats["cycles"],
+        "largest_cycle_jobs": own.stats["largest_cycle_jobs"],
+    }
+    return out
+
+
 def run(
     panel_rows: int = 5000,
     use_amp: bool = False,

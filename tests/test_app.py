@@ -13,11 +13,11 @@ from glosskernels import kernels
 class Fake:
     device = "fake"
 
-    def bands_many(self, reads, alphas, members):
+    def bands_many(self, reads, alphas, members, refusals=False):
         # Each quantile is its own level plus the member count; the grid is 1..9.
         return [
-            (np.tile(np.asarray(alphas) + members, (test_x.shape[0], 1)), np.tile(np.arange(1.0, 10.0), (test_x.shape[0], 1)))
-            for _train_x, _train_y, test_x in reads
+            (np.tile(np.asarray(levels) + members, (test_x.shape[0], 1)), np.tile(np.arange(1.0, 10.0), (test_x.shape[0], 1)))
+            for (_train_x, _train_y, test_x), levels in zip(reads, alphas)
         ]
 
     def misfit(self, x):
@@ -50,6 +50,7 @@ class _Sync:
 def client(monkeypatch):
     monkeypatch.setattr(kernels, "get", lambda: Fake())
     monkeypatch.setattr(kernels, "peek", lambda: Fake())
+    monkeypatch.setattr(app_module, "_OWNER", None)
     return _Sync()
 
 
@@ -108,3 +109,21 @@ def test_keys_gate_when_set(client, monkeypatch):
 def test_healthz(client):
     r = client.get("/healthz")
     assert r.status_code == 200 and r.json()["device"] == "fake"
+
+
+def test_a_full_queue_answers_429_with_retry_after(client, monkeypatch):
+    from glosskernels.owner import Busy
+
+    class Full:
+        def bands(self, *_a, **_k):
+            raise Busy("the kernel's queue is full — retry shortly", retry_after=7)
+
+    monkeypatch.setattr(app_module, "_OWNER", Full())
+    r = client.post("/bands", json={"alphas": [0.5], "reads": [READ]})
+    assert r.status_code == 429 and r.headers["retry-after"] == "7" and "full" in r.json()["error"]
+
+
+def test_a_body_over_the_cap_is_refused_before_it_is_parsed(client, monkeypatch):
+    monkeypatch.setattr(app_module, "MAX_BODY_MB", 0)
+    r = client.post("/bands", json={"alphas": [0.5], "reads": [READ]})
+    assert r.status_code == 413 and "in parts" in r.json()["error"]

@@ -144,10 +144,11 @@ class Kernels:
     def bands_many(
         self,
         reads: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
-        alphas: list[float],
+        alphas: list[float] | list[list[float]],
         members: int = 1,
         timings: dict | None = None,
-    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        refusals: bool = False,
+    ) -> list[tuple[np.ndarray, np.ndarray] | KernelError]:
         """Many reads, the device kept busy. One member is the pinned one
         (no normalization, no feature shuffle); more is the package's
         ensemble of that size.
@@ -160,7 +161,24 @@ class Kernels:
         group rides one chain: 814 tables a second on the same L4, the
         answers within 2e-5 of one at a time. What comes back is rescaled
         and averaged per read exactly as the package's `predict` does.
-        `timings`, when given, is filled with where the seconds went."""
+
+        `alphas` is one list for every read, or a list per read: the
+        forward pass does not depend on them, so reads asking for
+        different levels (each caller's record puts them elsewhere) still
+        ride together. With `refusals` a read the kernel refuses comes
+        back as its `KernelError` in place, the others answered — reads
+        from different callers must not fail each other; without, the
+        first refusal is raised. `timings`, when given, is filled with
+        where the seconds went."""
+        per_read = bool(alphas) and isinstance(alphas[0], (list, tuple, np.ndarray))
+        levels = [tuple(float(a) for a in (alphas[i] if per_read else alphas)) for i in range(len(reads))]
+        refused: dict[int, KernelError] = {}
+
+        def refuse(index: int, why: str) -> None:
+            refused[index] = KernelError(f"bands: read {index}: {why}")
+            if not refusals:
+                raise refused[index]
+
         clock = [time.perf_counter()]
 
         def lap(name: str) -> None:
@@ -174,70 +192,85 @@ class Kernels:
         for index, (train_x, train_y, test_x) in enumerate(reads):
             rows, cols = train_x.shape
             if rows < 2 or train_y.shape[0] != rows or test_x.ndim != 2 or test_x.shape[1] != cols:
-                raise KernelError(
-                    f"bands: read {index}: {rows} train rows x {cols} features against "
-                    f"{train_y.shape[0]} train values and test rows of shape {test_x.shape}"
+                refuse(
+                    index,
+                    f"{rows} train rows x {cols} features against {train_y.shape[0]} train values "
+                    f"and test rows of shape {test_x.shape}",
                 )
+                continue
             # The package's preprocessor drops constant columns (mean-imputed
             # first) and its member generator fails on an empty set with a
             # message about sequences; say what happened instead.
             imputed = np.where(np.isnan(train_x), np.nanmean(train_x, axis=0), train_x)
             if members > 1 and not np.any(imputed != imputed[0], axis=0).any():
-                raise KernelError(
-                    f"bands: read {index}: every feature column is constant over the training rows — "
-                    "nothing varies to band on"
-                )
-        scalers, tables = [], []  # tables: (read, Xs member-major, ys)
-        for index, made in enumerate(prepare_many(reads, members)):
+                refuse(index, "every feature column is constant over the training rows — nothing varies to band on")
+        sound = [index for index in range(len(reads)) if index not in refused]
+        scalers, tables = {}, []  # tables: (read, Xs member-major, ys)
+        for index, made in zip(sound, prepare_many([reads[i] for i in sound], members)):
             if isinstance(made, str):
-                raise KernelError(f"bands: read {index}: {made}")
-            scalers.append(made[1])
+                refuse(index, made)
+                continue
+            scalers[index] = made[1]
             tables.extend((index, xs, ys) for xs, ys in made[0])
         lap("prepare_s")
         groups: dict[tuple, list[int]] = {}
         for at, (_index, xs, ys) in enumerate(tables):
             groups.setdefault((xs.shape[1:], ys.shape[1:]), []).append(at)
-        answered: list[dict[str, np.ndarray] | None] = [None] * len(tables)
-        kinds = ["quantiles", "raw_quantiles"]
-        for (x_shape, _), members_of in groups.items():
+        answered: list[list | None] = [None] * len(tables)
+        answered_rows: dict[tuple, tuple] = {}
+        for group_key, members_of in groups.items():
+            x_shape = group_key[0]
             # As many tables a pass as saturate the device, fewer as they grow.
             per_pass = max(1, min(_TABLES_PER_PASS, _CELLS_PER_PASS // int(np.prod(x_shape))))
             device, config = self._configured(x_shape[0])
             spans = np.cumsum([0] + [tables[at][1].shape[0] for at in members_of])
             xs = np.concatenate([tables[at][1] for at in members_of])
             ys = np.concatenate([tables[at][2] for at in members_of])
-            outs = {kind: [] for kind in kinds}
+            owner = np.repeat([tables[at][0] for at in members_of], np.diff(spans))  # the read of each stacked table
             try:
                 with torch.no_grad():
                     for lo in range(0, xs.shape[0], per_pass):
-                        out = self.model.predict_stats(
+                        raw = self.model._inference_forward(
                             torch.from_numpy(xs[lo : lo + per_pass]).float().to(device),
                             torch.from_numpy(ys[lo : lo + per_pass]).float().to(device),
-                            output_type=kinds,
-                            alphas=alphas,
                             inference_config=config,
                         )
-                        for kind in kinds:
-                            outs[kind].append(out[kind].float().cpu().numpy())
+                        # As `predict_stats` reads them: the monotone grid, and
+                        # the quantiles at each caller's own levels.
+                        by_levels: dict[tuple, list[int]] = {}
+                        for row, read in enumerate(owner[lo : lo + per_pass]):
+                            by_levels.setdefault(levels[read], []).append(row)
+                        for asked, rows_ in by_levels.items():
+                            dist = self.model.quantile_dist(raw[rows_])
+                            q = dist.icdf(alpha=torch.tensor(asked, device=raw.device, dtype=raw.dtype))
+                            grid, q = dist.quantiles.float().cpu().numpy(), q.float().cpu().numpy()
+                            for slot, row in enumerate(rows_):
+                                answered_rows[(group_key, lo + row)] = (q[slot], grid[slot])
             except Exception as e:
-                raise KernelError(f"bands: {e}") from e
-            whole = {kind: np.concatenate(parts) for kind, parts in outs.items()}
+                for read in set(owner.tolist()):
+                    refused[read] = KernelError(f"bands: {e}")
+                if not refusals:
+                    raise KernelError(f"bands: {e}") from e
+                continue
             for slot, at in enumerate(members_of):
-                answered[at] = {kind: whole[kind][spans[slot] : spans[slot + 1]] for kind in kinds}
+                answered[at] = [answered_rows.pop((group_key, row)) for row in range(spans[slot], spans[slot + 1])]
 
         lap("forward_s")
         if timings is not None:
             timings["tables"], timings["shapes"] = len(tables), len(groups)
-        results = []
         mine_of: dict[int, list] = {}
         for at, table in enumerate(tables):
-            mine_of.setdefault(table[0], []).append(answered[at])
-        for index, y_scaler in enumerate(scalers):
-            mine = mine_of[index]
+            if answered[at] is not None:
+                mine_of.setdefault(table[0], []).extend(answered[at])
+        results = []
+        for index in range(len(reads)):
+            if index in refused:
+                results.append(refused[index])
+                continue
             pair = []
-            for kind in kinds:
-                arr = np.concatenate([m[kind] for m in mine])  # (members, test rows, quantiles)
-                scaled = y_scaler.inverse_transform(arr.reshape(-1, 1)).reshape(arr.shape)
+            for kind in (0, 1):  # quantiles at the levels, the raw grid
+                arr = np.stack([member[kind] for member in mine_of[index]])  # (members, test rows, quantiles)
+                scaled = scalers[index].inverse_transform(arr.reshape(-1, 1)).reshape(arr.shape)
                 pair.append(np.mean(scaled, axis=0).astype(np.float64))
             results.append((pair[0], pair[1]))
         lap("finish_s")
