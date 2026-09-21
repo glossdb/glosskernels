@@ -165,25 +165,24 @@ def test_whatif_grades_an_oracle_as_honest_and_replay_as_the_arithmetic_half():
     world, revenue = whatif.simulate(members=30, months=30, elasticity=1.5, seed=4)
     assert revenue.shape == (30, 30) and 0.6 < world.price.min() < world.price.max() < 1.6
 
-    # A backend that knows the structure: size, season and elasticity, and
-    # the spread of what no column holds (the month's shock and the noise).
-    def oracle(train_x, train_y, test_x, alphas):
-        season = 1.0 + 0.2 * np.sin(2 * np.pi * ((test_x[:, 1] - 1) % 12) / 12.0)
-        centre = np.log(season * test_x[:, 2] ** (1.0 - 1.5))
-        spread = np.hypot(0.08, 0.05)
-        return np.exp(centre[:, None] + spread * norm.ppf(alphas)[None, :])
+    # A backend that knows the structure — season, elasticity, and the
+    # spread of what no column holds (the month's shock and the noise) —
+    # and reads the level of revenue-over-size off the training rows.
+    def shape(x):
+        season = 1.0 + 0.2 * np.sin(2 * np.pi * ((x[:, 1] - 1) % 12) / 12.0)
+        return season * (x[:, 2] / x[:, 3]) ** (1.0 - 1.5)
 
     def sized(train_x, train_y, test_x, alphas):
-        # The context's target is revenue over the member's size; the oracle
-        # reads that ratio's level off the training rows.
-        season = 1.0 + 0.2 * np.sin(2 * np.pi * ((train_x[:, 1] - 1) % 12) / 12.0)
-        level = np.median(train_y / (season * train_x[:, 2] ** -0.5))
-        return level * oracle(train_x, train_y, test_x, alphas)
+        level = np.median(train_y / shape(train_x))
+        return level * shape(test_x)[:, None] * np.exp(np.hypot(0.08, 0.05) * norm.ppf(alphas))[None, :]
 
-    out = whatif.grade_worlds(sized, worlds=6, members=30, months=30)
-    for factor in ("0.9", "1.1", "1.5"):
+    # A month's shock is shared by every member, so coverage is counted in
+    # months, not rows: 24 worlds of 6 held months put it within ~0.03.
+    out = whatif.grade_worlds(sized, worlds=24, members=30, months=30, draws=50)
+    for factor in ("1.0", "0.9", "1.1", "1.5"):
         read = out["factors"][factor]
-        assert abs(read["coverage80"] - 0.8) < 0.12
-        assert read["median_off"] < read["replay_off"]
+        assert abs(read["coverage80"] - 0.8) < 0.1
+        # Replay is exact where nothing is pulled, and only there.
+        assert factor == "1.0" or read["median_off"] < read["replay_off"]
     assert out["factors"]["1.5"]["true_move"] == round(1.5**-0.5, 3)
     assert out["factors"]["1.5"]["replay_off"] > 0.7

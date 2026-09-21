@@ -74,7 +74,7 @@ def grade(
 ) -> dict:
     """The last `held` months are the scenario's: the context is every
     member's rows before them (the member's size, the month of year, the
-    price; revenue in units of the member's size), and the read is those
+    price and the member's usual price; revenue in units of the size), and the read is those
     months with price moved by each factor. Truth is the pulled world
     run `draws` times: one draw lands as the actual, all of them give
     the true median. `replay` is the arithmetic half alone — volume
@@ -84,11 +84,18 @@ def grade(
     world, revenue = simulate(**world_kwargs)
     members, months = revenue.shape
     cut = months - held
-    size = revenue[:, :cut].mean(axis=1, keepdims=True)  # known at the scenario's start
+    # Known at the scenario's start: the member's size, and the price it
+    # has usually charged. Revenue in units of size has the member's price
+    # level divided out of it, so the row must say where a price stands
+    # against that level — without it a read that knows the structure
+    # exactly still covers 70% at a nominal 80.
+    size = revenue[:, :cut].mean(axis=1, keepdims=True)
+    usual = np.exp(np.log(world.price[:, :cut]).mean(axis=1, keepdims=True))
     moy = np.tile(np.arange(months) % 12 + 1, (members, 1))
 
     def rows(price: np.ndarray, span: slice) -> np.ndarray:
-        return np.column_stack([np.log(np.broadcast_to(size, price.shape)[:, span].ravel()), moy[:, span].ravel(), price[:, span].ravel()])
+        wide = lambda a: np.broadcast_to(a, price.shape)[:, span].ravel()  # noqa: E731
+        return np.column_stack([np.log(wide(size)), moy[:, span].ravel(), price[:, span].ravel(), wide(usual)])
 
     train_x = rows(world.price, slice(0, cut))
     train_y = (revenue / size)[:, :cut].ravel()
