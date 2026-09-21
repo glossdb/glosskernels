@@ -116,8 +116,9 @@ WHERE voice = 'blend' ORDER BY metric, month
 - Judgment rides `basis`, as in the what-if: a metric with too little
   history, a covariate that does not reach the last forecast month
   ("planned_price ends 2027-03; the forecast asks through 2027-12"), a
-  past-only series with no `lag` — each is a refusal row with its reason,
-  and the other metrics are served.
+  past-only series with no `lag`, a `total` asked of a stock (a level has
+  no sum over months; its year is its last month) — each is a refusal row
+  with its reason, and the other metrics are served.
 - The newest month, where partial, is not an origin: the origin is the last
   whole month (the walk's `partial` rule).
 
@@ -146,7 +147,7 @@ The door:
   no way to edit a band.
 - Every evaluated variant is a row in the record, with its origins counted.
 
-The skill (a `forecast.md` reference under `glossql-metrics`):
+The skill (defined below):
 
 - Read the floor first: a forecast that does not beat seasonal-naive on the
   backtest is served with that said, and the blend is the default reading.
@@ -160,6 +161,66 @@ The skill (a `forecast.md` reference under `glossql-metrics`):
   normalising history and what-ifs. It would arrive as an imported dataset
   like any other, its snapshots its vintages; the paid key stays with what
   fetches it.
+
+## The skill
+
+Where an agent learns this is a product skill, as it learns apps and
+functions: `skills/glossql-forecast/` — a `SKILL.md` and its references,
+embedded in the server and served on the door as `skill://` resources and
+as a prompt. Its own skill, not a page of `glossql-metrics`: a forecast is
+asked for, it is not one of the seven goals a workspace is done by, and its
+description has to load on other words — outlook, plan, budget, next
+year. `glossql-metrics/references/doors.md` gains three lines pointing to
+it, beside the what-if and the sample door.
+
+It teaches judgment and no mechanics. The agent writes declarations and
+reads; it never writes model code, feature code or a backtest loop — those
+are the door's, which is what keeps a forecast reproducible and a backtest
+free of leaks whoever asked. Where the procedure can ride the record it
+does, not the prose:
+
+- `workspace_next` gains a `forecasts` surface beside `scenarios` and
+  `samples` — how many stand, how many are declared without a body, and the
+  act that writes one.
+- The `next` routes carry the order: a forecast glossed and not walked →
+  run `forecast_walk`; walked → read `forecast.<name>()`; walked and over
+  the floor on most of its metrics → say so before any future month is read.
+
+What is left to the page is what no record can decide:
+
+1. **The ask.** Which metric, how far, months or the year's total, and what
+   decision it serves. A flow has a total; a stock has a level. Where the
+   human has not said, ask — the door's question round exists for it.
+2. **Whether to forecast at all.** The metric is grounded, applicable and
+   monthly; the bands walk ran and no band is red without a ruling — a
+   forecast of a metric with an open data problem forecasts the problem.
+   Under about eighteen months, say the history is too short and serve the
+   walk's bands instead.
+3. **The first declaration is the smallest.** Metrics and horizon, nothing
+   else. Walk it. Read the floor before the future.
+4. **The window.** All history unless the record says the series changed —
+   a ruling, a re-grounding, a regime the human names. The basis is that
+   event, never a better backtest.
+5. **A covariate.** Mechanism and direction first, in the `basis`. Known
+   through the last forecast month, or lagged. One at a time, as a second
+   forecast beside the first; kept when it helps across metrics and
+   origins. How many variants the record holds is part of the answer.
+6. **What the human knows and history does not.** A price change, a lost
+   customer, a plant closing: never an adjustment to a band. It is a
+   covariate if it is a series, a scenario if it is a lever, and otherwise
+   a sentence beside the forecast saying what it does not include.
+7. **The read-back.** The band before the median; the 80% band by default;
+   one sentence from the backtest — how often that band held, and whether
+   the forecast beat last year's month. Then what the forecast is blind to.
+8. **Outside data.** A source like any other: landed, structured, grounded
+   as a metric, then named as a covariate. The calendar first; the
+   customer's own plans next; weather to normalise history or to ask a
+   what-if, not to call next spring.
+
+References, each short: `covariates.md` (availability, lags, the calendar,
+the comparison read), `read-back.md` (the sentences, with a worked example
+off the fixture). Every fenced example in a product skill must parse and
+plan, so the skill lands with the door, not before it.
 
 ## Forks for the project lead
 
@@ -178,6 +239,10 @@ The skill (a `forecast.md` reference under `glossql-metrics`):
 5. **The calendar's home.** A shipped function over a region named in
    `conventions`, offline and deterministic; its worth at monthly grain is
    unmeasured and is each dataset's backtest to show.
+6. **Its own skill, or a page of `glossql-metrics`.** Proposed: its own, for
+   the reasons above; the page is the smaller change.
+7. **How much of the order the `next` routes carry.** Proposed: walk before
+   read, and the floor said before the future. More than that is prose.
 
 ## What the kernel still owes
 
@@ -197,8 +262,9 @@ The skill (a `forecast.md` reference under `glossql-metrics`):
    `/misfit`), answers unchanged.
 2. `forecast_walk` and `forecast_points()`: the backtest first, because the
    future read is calibrated from it.
-3. `forecast.<name>()`, without covariates.
-4. Covariates: metrics first, the calendar after.
+3. `forecast.<name>()`, without covariates — and `skills/glossql-forecast`
+   with it, the `forecasts` surface and the `next` routes.
+4. Covariates: metrics first, the calendar after; `covariates.md` with them.
 
 Done when a fixture dataset declares a forecast, reads twelve future months
 and a total with a `basis` on every row, reads its backtest against the
