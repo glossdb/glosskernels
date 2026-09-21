@@ -4,6 +4,9 @@ open item 8).
 
     uv run modal deploy modal_app.py      # the service, proxy-authed
     uv run modal run modal_app.py         # the measurements, printed
+    GLOSSKERNELS_GPU=L4 uv run modal run modal_app.py --amp --context-rows 5000,20000,100000
+                                          # and a shared instance's questions: cached
+                                          # contexts, concurrent callers
 
 The image bakes the regressor checkpoint; a container never fetches
 weights at start.
@@ -31,6 +34,8 @@ image = (
         "starlette>=1.6",
         "uvicorn>=0.52",
         "huggingface-hub>=0.30",
+        # NVML behind torch.cuda.utilization: the busy fraction in the measurements.
+        "nvidia-ml-py>=12",
     )
     # Bake the regressor: the same hub file kernels.fetch_checkpoints pulls,
     # fetched here without the package on the path yet.
@@ -74,12 +79,13 @@ def probe() -> float:
     return round(time.perf_counter() - t, 3)
 
 
-@app.function(gpu=GPU, cpu=CPU, region=REGION, timeout=900)
-def measure(use_amp: bool = False, misfit_workers: int = 0) -> dict:
-    """The reads at their real shapes on the GPU (glosskernels.measure)."""
-    from glosskernels.measure import run
+@app.function(gpu=GPU, cpu=CPU, region=REGION, timeout=3600)
+def measure(use_amp: bool = False, misfit_workers: int = 0, context_rows: str = "") -> dict:
+    """The reads at their real shapes on the GPU (glosskernels.measure);
+    with `context_rows`, the cached-context and concurrency sections too."""
+    from glosskernels.measure import _rows, run
 
-    return run(use_amp=use_amp, misfit_workers=misfit_workers or None)
+    return run(use_amp=use_amp, misfit_workers=misfit_workers or None, context_rows=_rows(context_rows))
 
 
 @app.function(gpu=GPU, cpu=CPU, region=REGION, timeout=1200)
@@ -91,7 +97,7 @@ def parity(use_amp: bool = False) -> dict:
 
 
 @app.local_entrypoint()
-def main(amp: bool = False, check_parity: bool = False, misfit_workers: int = 0):
+def main(amp: bool = False, check_parity: bool = False, misfit_workers: int = 0, context_rows: str = ""):
     if check_parity:
         print(parity.remote(use_amp=amp))
         return
@@ -102,4 +108,4 @@ def main(amp: bool = False, check_parity: bool = False, misfit_workers: int = 0)
     load_warm = probe.remote()
     warm_s = round(time.perf_counter() - t, 2)
     print({"gpu": GPU, "cold_call_s": cold_s, "cold_load_s": load_cold, "warm_call_s": warm_s, "warm_load_s": load_warm})
-    print(measure.remote(use_amp=amp, misfit_workers=misfit_workers))
+    print(measure.remote(use_amp=amp, misfit_workers=misfit_workers, context_rows=context_rows))

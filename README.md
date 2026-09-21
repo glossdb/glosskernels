@@ -49,7 +49,12 @@ hold the reads to the port repo's pinned oracle fixtures.
 
 - Modal (`modal_app.py`): `uv run modal deploy modal_app.py` serves the
   app behind a T4 in the EU with Modal's proxy auth; `uv run modal run
-  modal_app.py` prints the timings.
+  modal_app.py` prints the timings. With `--context-rows 5000,20000,100000`
+  the run adds what a shared instance turns on: a panel held as a cached
+  context (`repr` and `kv`) against refitting it per call, and the short
+  reads under concurrent callers with and without the service's lock.
+  `GLOSSKERNELS_GPU=L4` names the GPU; `--amp` and `--check-parity` grade
+  reduced precision against the fixtures.
 - A container (`Dockerfile`): the same process on whatever GPU the
   host has, CPU without one.
 
