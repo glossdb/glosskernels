@@ -20,6 +20,8 @@ from typing import Callable
 
 import numpy as np
 
+from .. import calibration
+
 MIN_TRAIN = 5  # the walk's floor on training rows
 
 # (train_x, train_y, test_x, alphas) -> (test rows, alphas)
@@ -255,7 +257,9 @@ class _Once:
 
 
 class Calibrated:
-    """A voice read through its own record. Each answer is kept; once
+    """A voice read through its own record — the harness playing the
+    record's part (keeping the PITs, handing them back) around the
+    kernel's pure `calibration.recalibrate`. Each answer is kept; once
     the month it called has landed, the PIT of the actual against it
     joins the voice's history — the panel's, every series together, as
     a metric's own six walked months say too little alone — kept apart
@@ -270,7 +274,7 @@ class Calibrated:
     outside the raw grid's ends cannot be reached — a voice too narrow
     past its first percentile stays so."""
 
-    def __init__(self, inner, min_history: int = 100):
+    def __init__(self, inner, min_history: int = calibration.MIN_HISTORY):
         self.inner, self.name, self.min_history = inner, f"cal:{inner.name}", min_history
         self._pending: dict[tuple, np.ndarray] = {}  # (panel, h, origin) -> the raw answer
         self._pits: dict[tuple, list[np.ndarray]] = {}  # (panel, h) -> landed PITs
@@ -282,20 +286,13 @@ class Calibrated:
         # origin, and what tells the months from their trailing sums.
         panel = y[:, :24].tobytes()
         for key in sorted(k for k in self._pending if k[0] == panel and k[2] + k[1] - 1 < t):
-            answer, actual = np.sort(self._pending.pop(key), axis=1), y[:, key[2] + key[1] - 1]
+            answer, actual = self._pending.pop(key), y[:, key[2] + key[1] - 1]
             landed = ~np.isnan(actual) & ~np.isnan(answer).any(axis=1)
-            pits = (answer[landed] <= actual[landed, None]).sum(axis=1) / (answer.shape[1] + 1)
-            self._pits.setdefault(key[:2], []).append(pits)
+            self._pits.setdefault(key[:2], []).append(calibration.pit(answer[landed], actual[landed]))
         self._pending[(panel, h, t)] = raw
         history = self._pits.get((panel, h))
         pits = np.concatenate(history) if history else np.zeros(0)
-        if pits.shape[0] < self.min_history:
-            return raw
-        levels = np.quantile(pits, alphas)
-        out = np.full_like(raw, np.nan)
-        for s in np.flatnonzero(~np.isnan(raw).any(axis=1)):
-            out[s] = np.interp(levels, alphas, np.sort(raw[s]))
-        return out
+        return calibration.recalibrate(raw, alphas, pits, self.min_history)
 
 
 class Blend:

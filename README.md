@@ -87,6 +87,17 @@ uv run python -m glosskernels.harness --panel hospital --project 2 --burn 8 \\
 | `blend:<voice>+<voice>` | its voices' | the mean of their quantiles, level by level |
 | `cal:<voice>` | the voice's own landed PITs, the panel's together | the voice, its bands re-read at the levels its record puts them, per horizon |
 
+A what-if cannot be graded on a real panel — the pulled world never
+lands — so `--whatif` simulates one whose structure is known (revenue
+is price times volume, the recipe; volume answers price, the behavior)
+and runs the pulled world for the truth: the model's read from the
+panel against replay's arithmetic alone, inside and outside the prices
+the panel has seen, clean and with a demand shock no column holds.
+
+Calibration is the kernel's (`glosskernels.calibration`): a pure
+function of the raw answer and the PITs the caller kept. The record
+stores PITs and hands them back; the statistics stay here.
+
 Panels: `tourism_monthly`, `hospital`, `car_parts` (the Monash archive
 from the hub) and `synthetic` (no network). Nori wants torch
 under 2.14, and uv resolves every group into one lock, so the `harness`

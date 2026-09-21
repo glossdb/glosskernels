@@ -155,3 +155,35 @@ def test_blend_is_the_mean_of_the_band_ends():
     blend = voices.Blend([Fixed("a", 0.0), Fixed("b", 10.0)])
     assert blend.name == "blend:a+b"
     assert np.allclose(blend.step(np.zeros((2, 5)), np.ones(6), [0.1, 0.9]), [[5.1, 5.9]] * 2)
+
+
+def test_whatif_grades_an_oracle_as_honest_and_replay_as_the_arithmetic_half():
+    from scipy.stats import norm
+
+    from glosskernels.harness import whatif
+
+    world, revenue = whatif.simulate(members=30, months=30, elasticity=1.5, seed=4)
+    assert revenue.shape == (30, 30) and 0.6 < world.price.min() < world.price.max() < 1.6
+
+    # A backend that knows the structure: size, season and elasticity, and
+    # the spread of what no column holds (the month's shock and the noise).
+    def oracle(train_x, train_y, test_x, alphas):
+        season = 1.0 + 0.2 * np.sin(2 * np.pi * ((test_x[:, 1] - 1) % 12) / 12.0)
+        centre = np.log(season * test_x[:, 2] ** (1.0 - 1.5))
+        spread = np.hypot(0.08, 0.05)
+        return np.exp(centre[:, None] + spread * norm.ppf(alphas)[None, :])
+
+    def sized(train_x, train_y, test_x, alphas):
+        # The context's target is revenue over the member's size; the oracle
+        # reads that ratio's level off the training rows.
+        season = 1.0 + 0.2 * np.sin(2 * np.pi * ((train_x[:, 1] - 1) % 12) / 12.0)
+        level = np.median(train_y / (season * train_x[:, 2] ** -0.5))
+        return level * oracle(train_x, train_y, test_x, alphas)
+
+    out = whatif.grade_worlds(sized, worlds=6, members=30, months=30)
+    for factor in ("0.9", "1.1", "1.5"):
+        read = out["factors"][factor]
+        assert abs(read["coverage80"] - 0.8) < 0.12
+        assert read["median_off"] < read["replay_off"]
+    assert out["factors"]["1.5"]["true_move"] == round(1.5**-0.5, 3)
+    assert out["factors"]["1.5"]["replay_off"] > 0.7
