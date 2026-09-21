@@ -18,7 +18,14 @@ from pathlib import Path
 
 import modal
 
-REGION = "eu-west"
+# The service runs in the EU. A measurement on random numbers has no
+# residency to keep: `GLOSSKERNELS_REGION=` (empty) takes a GPU wherever
+# one is free — an L40S can queue a long while in one region.
+REGION = os.environ.get("GLOSSKERNELS_REGION", "eu-west") or None
+# Two measurement runs at once would claim the same web endpoint label
+# and the second would fail; `GLOSSKERNELS_LABEL` gives a run its own.
+# Unset, the deployed service keeps its URL.
+LABEL = os.environ.get("GLOSSKERNELS_LABEL") or None
 # The GPU under measurement: `GLOSSKERNELS_GPU=L4 modal run …`.
 GPU = os.environ.get("GLOSSKERNELS_GPU", "T4")
 # Four cores beside the GPU: the chain-rule read builds an estimator per
@@ -59,7 +66,7 @@ app = modal.App("glosskernels", image=image)
 
 @app.function(gpu=GPU, cpu=CPU, region=REGION, scaledown_window=300, timeout=600)
 @modal.concurrent(max_inputs=8)
-@modal.asgi_app(requires_proxy_auth=True)
+@modal.asgi_app(requires_proxy_auth=True, label=LABEL)
 def serve():
     from glosskernels import kernels
     from glosskernels.app import app as asgi
