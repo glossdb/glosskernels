@@ -460,10 +460,26 @@ class Kernels:
         random_state: int = 0,
         train: np.ndarray | None = None,
         workers: int | None = None,
-    ) -> np.ndarray:
+        columns: bool = False,
+        folds: int = 1,
+    ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
         """Mean log density per row over the orderings in `perms`, fit on
         `train` (default: the frame itself). Log space end to end — the
         package's `score_samples` exponentiates the same mean.
+
+        With `columns`, also (rows, cols): each column's share of that
+        score — its conditional log density, averaged over the orderings
+        as the score is — so a row's shares sum to its score and the
+        lowest one names the cell that made the row improbable. A column
+        with too few values to fit is NaN, and adds nothing to the score.
+
+        With `folds` over 1 no row is in the context that scores it: the
+        frame is split, and each part is scored from the rest. A frame
+        that scores itself lets every row find itself in the context, which
+        hides a value that is ordinary for its column and wrong for its
+        row (planted sign flips: their cells ranked 9-344 of 1200 lowest
+        self-fit, 4-77 over two folds); a value far outside its column is
+        named either way. The cost is that many times the fits.
 
         The orderings default to the port's protocol: identity and
         reverse, so every column conditions both early and late and the
@@ -486,6 +502,18 @@ class Kernels:
         rows, cols = x.shape
         if rows < 2 or cols < 2:
             raise KernelError(f"misfit: {rows} rows x {cols} features — the read needs two of each")
+        if folds > 1:
+            if train is not None or rows < 2 * folds:
+                raise KernelError(f"misfit: {folds} folds split one frame, of at least {2 * folds} rows")
+            order = np.random.default_rng(random_state).permutation(rows)
+            scores, shares = np.empty(rows), np.empty((rows, cols))
+            for f in range(folds):
+                out = np.sort(order[f::folds])
+                rest = np.setdiff1d(order, out)
+                scores[out], shares[out] = self.misfit(
+                    x[out], perms=perms, random_state=random_state, train=x[rest], workers=workers, columns=True
+                )
+            return (scores, shares) if columns else scores
         u = _Unsupervised(
             self.model,
             n_estimators=1,
@@ -535,7 +563,7 @@ class Kernels:
                 x_train, x_test = noise
             y_train = u.X_[train_mask, col]
             est, _categorical = u._fit_conditional_estimator(col, x_train, y_train)
-            return pi, u._log_prob_numerical(est, x_test, xf[:, col])
+            return pi, col, u._log_prob_numerical(est, x_test, xf[:, col])
 
         workers = workers or misfit_workers(self.device)
         try:
@@ -549,9 +577,12 @@ class Kernels:
         except Exception as e:
             raise KernelError(f"misfit: {e}") from e
         sums = np.zeros((n_permutations, rows))
-        for pi, lp in results:  # task order — the loop's summation order
+        shares = np.full((n_permutations, rows, cols), np.nan)
+        for pi, col, lp in results:  # task order — the loop's summation order
             sums[pi] += lp
-        return np.mean(sums, axis=0)
+            shares[pi, :, col] = lp
+        scores = np.mean(sums, axis=0)
+        return (scores, np.mean(shares, axis=0)) if columns else scores
 
 
 def misfit_workers(device: str) -> int:

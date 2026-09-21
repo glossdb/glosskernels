@@ -38,7 +38,7 @@ by name.
 | route | body | answer |
 |---|---|---|
 | `POST /bands` | `alphas`, `reads` (each `train_x`, `train_y`, `test_x` rows × cols — or `context` in place of the train rows — and optionally `actual` and `salt` per test row, `cache`), `members`, `pit_history` | per read: `quantiles` (rows × alphas), `pit` where an actual was given, `raw` when a `pit_history` was, `context` when kept |
-| `POST /misfit` | `x` (rows × cols) | `scores` (per row; log density, higher fits the frame better) |
+| `POST /misfit` | `x` (rows × cols), `columns`, `folds` | `scores` (per row; log density, higher fits the frame better) and, with `columns: true`, `columns` (rows × cols; each column's share of the row's score — they sum to it, the lowest names the cell) |
 | `GET /healthz` | | `status`, `device`, `loaded` |
 
 With `voices` (`tabicl` and any of `chronos2`, `seasonal_naive`) each read
@@ -52,7 +52,8 @@ normalization, no feature shuffle); more runs the package's ensemble of
 that size. With `pit_history` — 100 counts of past PITs per hundredth —
 the quantiles are read through that record and the kernel's default one
 (`glosskernels.calibration`). `misfit` fits and scores the same frame over
-two feature orderings, numeric columns only. The tests hold the reads to
+two feature orderings, numeric columns only; with `folds` (2 to 10) each
+row is scored from a context it is not in, at that many times the fits. The tests hold the reads to
 the port repo's pinned oracle fixtures. Where this is going:
 `docs/deployment-design.md`.
 

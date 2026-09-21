@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from glosskernels.kernels import Kernels
+from glosskernels.kernels import KernelError, Kernels
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 ALPHAS = [0.05, 0.10, 0.50, 0.90, 0.95]
@@ -102,3 +102,22 @@ def test_self_fit_misfit_ranks_an_outlier_last(k):
     x[7] = [6.0, -6.0, 6.0, -6.0]
     logs = k.misfit(x)
     assert int(np.argmin(logs)) == 7
+
+
+def test_misfit_columns_sum_to_the_score_and_name_the_cell(k):
+    rng = np.random.default_rng(3)
+    x = rng.normal(size=(60, 4))
+    x[:, 1] = 0.8 * x[:, 0] + 0.2 * x[:, 1]
+    x[7, 2] = 9.0  # one cell off; the rest of the row ordinary
+    logs, shares = k.misfit(x, columns=True)
+    assert shares.shape == x.shape
+    assert np.array_equal(logs, k.misfit(x))  # asking per column changes no score
+    assert np.allclose(shares.sum(axis=1), logs, rtol=1e-6, atol=1e-6)
+    assert int(np.argmin(shares[7])) == 2
+    # Scored from a context it is not in, the cell is the frame's least likely.
+    held, held_shares = k.misfit(x, columns=True, folds=2)
+    assert np.allclose(held_shares.sum(axis=1), held, rtol=1e-6, atol=1e-6)
+    assert int(np.argmin(held)) == 7
+    assert np.unravel_index(np.argmin(held_shares), held_shares.shape) == (7, 2)
+    with pytest.raises(KernelError, match="folds"):
+        k.misfit(x[:3], folds=2)

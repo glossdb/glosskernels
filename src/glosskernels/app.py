@@ -334,17 +334,27 @@ class Bands:
 
 
 class Misfit:
-    """The chain-rule density read over one frame, log space."""
+    """The chain-rule density read over one frame, log space — per row,
+    and with `columns` per cell: the same conditionals, not summed. With
+    `folds`, each row is scored from a context it is not in."""
 
     @staticmethod
     def parse(body):
-        return {"x": _matrix(body, "x", ndim=2)}
+        columns = body.get("columns", False)
+        if not isinstance(columns, bool):
+            raise Refusal("`columns` is true or false", 400)
+        folds = body.get("folds", 1)
+        if not isinstance(folds, int) or isinstance(folds, bool) or not 1 <= folds <= 10:
+            raise Refusal("`folds` is a whole number from 1 to 10", 400)
+        return {"x": _matrix(body, "x", ndim=2), "columns": columns, "folds": folds}
 
     @staticmethod
-    async def serve(own: Owner, caller: str, x):
-        # The chain rule fits a conditional per column per ordering: the frame, that many times.
-        waiting = own.exclusive(caller, "misfit", 2 * x.shape[1] * x.size, lambda k: k.misfit(x))
-        return {"scores": await asyncio.wrap_future(waiting)}
+    async def serve(own: Owner, caller: str, x, columns, folds):
+        # The chain rule fits a conditional per column per ordering: the frame, that many times — per fold.
+        work = 2 * x.shape[1] * x.size * folds
+        waiting = own.exclusive(caller, "misfit", work, lambda k: k.misfit(x, columns=columns, folds=folds))
+        got = await asyncio.wrap_future(waiting)
+        return {"scores": got[0], "columns": got[1]} if columns else {"scores": got}
 
 
 async def healthz(_: Request) -> Response:

@@ -30,8 +30,9 @@ class Fake:
             out.append(kernels.Answered(spoken, kept))
         return out
 
-    def misfit(self, x):
-        return np.array([0.1, float("nan")])
+    def misfit(self, x, columns=False, folds=1):
+        scores = np.array([0.1, float("nan")])
+        return (scores, np.array([[0.3, -0.2], [float("nan"), 1.0]])) if columns else scores
 
 
 class _Sync:
@@ -93,6 +94,12 @@ def test_misfit_non_finite_becomes_null(client):
     r = client.post("/misfit", json={"x": [[1, 2], [3, 4]]})
     assert r.status_code == 200
     assert r.json() == {"scores": [0.1, None]}
+    r = client.post("/misfit", json={"x": [[1, 2], [3, 4]], "columns": True})
+    assert r.json() == {"scores": [0.1, None], "columns": [[0.3, -0.2], [None, 1.0]]}
+    r = client.post("/misfit", json={"x": [[1, 2], [3, 4]], "columns": "yes"})
+    assert r.status_code == 400 and "columns" in r.json()["error"]
+    r = client.post("/misfit", json={"x": [[1, 2], [3, 4]], "folds": 0})
+    assert r.status_code == 400 and "folds" in r.json()["error"]
 
 
 def test_shape_and_type_refusals(client):

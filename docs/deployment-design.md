@@ -69,7 +69,19 @@ bands (summed bands covered 94–99% at a nominal 80).
 
 `{"x": [[…]], "columns": true}` → `scores` per row (log density, higher
 fits better) and, with `columns`, per row × column: which cell made the row
-improbable.
+improbable. A cell's number is its column's conditional log density,
+averaged over the orderings as the score is, so a row's cells sum to its
+score; nothing more is computed — the read already fits every conditional,
+and this returns them unsummed.
+
+`"folds": n` scores each row from a context it is not in (the frame split
+in n, each part scored from the rest). A frame that scores itself lets a
+row find itself in the context. A value far outside its column is named
+either way; a value ordinary for its column and wrong for its row is not —
+planted sign flips in 200 × 6 frames had their cells ranked 9–344 of 1,200
+self-fit, 4–77 over two folds, 2–43 over five — at about that many times
+the fits. A broken relation implicates both of its ends: the chain rule
+charges whichever column comes later in an ordering.
 
 ## The context cache
 
@@ -234,5 +246,6 @@ entity scoring · synthetic twins.
 - [ ] Projections held in the harness: at or under the naive floor at every
       horizon (met by the three-voice blend), annual-total coverage within 5
       points of 80 (64–72 today) — per-horizon default records are the lever.
-- [ ] `/misfit` per column.
+- [x] `/misfit` per column (`columns: true`): the conditionals the score sums, returned unsummed;
+      `folds` to score rows from a context they are not in.
 - [ ] glossql moves to this API.
