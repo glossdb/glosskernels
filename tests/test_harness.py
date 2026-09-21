@@ -119,3 +119,39 @@ def test_projection_scores_months_and_totals():
     assert {"h1", "h3", "h6", "h12", "total_summed", "total_direct"} <= set(v)
     # Monthly bands added up claim every month misses together: wider than the total called directly.
     assert v["total_summed"]["width80"] > v["total_direct"]["width80"]
+
+
+def test_seasonal_recipe_anchors_on_the_same_month():
+    v = np.arange(1.0, 31.0)  # months 0..29
+    feats, labels = voices.seasonal_recipe(v, np.arange(36) % 12 + 1, h=6)
+    assert feats.shape == (30, 7) and labels.tolist() == v[6:].tolist()
+    # The month to call is 35, called from 29: a year back is month 23, two years month 11;
+    # the level is months 18..29 against 6..17; the last known month closes the row.
+    assert feats[-1].tolist() == [35.0, 12.0, 24.0, 12.0, 24.5, 12.5, 30.0]
+    # Thirteen months out, a year back is not yet known: the anchor steps back two.
+    assert voices.seasonal_recipe(v, np.arange(43) % 12 + 1, h=13)[0][-1, 2] == v[42 - 24]
+
+
+def test_calibration_keeps_horizons_and_panels_apart():
+    rng = np.random.default_rng(5)
+    start = np.datetime64("2010-01", "M")
+    months = np.arange(start, start + np.timedelta64(96, "M"), dtype="datetime64[M]")
+    panel = panels.Panel("noise", months, 100.0 + rng.normal(size=(60, 96)))
+    raw = voices._Once(_Narrow())
+    out = score.project(panel, [raw, voices.Calibrated(raw)], origins=2, burn=6)
+    for read in ("h1", "h12"):
+        assert out["voices"]["narrow"][read]["coverage80"] < 0.72
+        assert abs(out["voices"]["cal:narrow"][read]["coverage80"] - 0.8) < 0.08
+
+
+def test_blend_is_the_mean_of_the_band_ends():
+    class Fixed:
+        def __init__(self, name, at):
+            self.name, self.at = name, at
+
+        def step(self, y, moy, alphas, h=1):
+            return np.tile(self.at + np.asarray(alphas), (y.shape[0], 1))
+
+    blend = voices.Blend([Fixed("a", 0.0), Fixed("b", 10.0)])
+    assert blend.name == "blend:a+b"
+    assert np.allclose(blend.step(np.zeros((2, 5)), np.ones(6), [0.1, 0.9]), [[5.1, 5.9]] * 2)

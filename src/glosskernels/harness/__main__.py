@@ -25,7 +25,7 @@ def main() -> None:
     panel = (panels.synthetic() if args.panel == "synthetic" else panels.load(args.panel)).head(args.series)
     built = voices.build([v.strip() for v in args.voices.split(",") if v.strip()])
     if args.project:
-        scores = score.project(panel, built, origins=args.project)
+        scores = score.project(panel, built, origins=args.project, burn=args.burn)
     else:
         scores = score.walk(panel, built, months=args.months, burn=args.burn)
     text = json.dumps(scores, indent=1)

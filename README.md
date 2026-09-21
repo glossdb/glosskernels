@@ -72,7 +72,8 @@ uv run python -m glosskernels.harness --panel hospital --voices seasonal_naive,w
 # a voice read through its own record: twelve months walked first, the PITs they leave recalibrate the six scored
 uv run python -m glosskernels.harness --panel hospital --burn 12 --voices seasonal_naive,walk:tabicl,cal:walk:tabicl
 # projections: every month a year out from two origins, and the year's total — monthly bands summed against the total called directly
-uv run python -m glosskernels.harness --panel hospital --project 2 --voices seasonal_naive,walk:tabicl,chronos2 --out scores.json
+uv run python -m glosskernels.harness --panel hospital --project 2 --burn 8 \\
+    --voices seasonal_naive,walk:tabicl,chronos2,cal:blend:walk:tabicl+chronos2 --out scores.json
 ```
 
 | voice | the context | the model |
@@ -82,7 +83,9 @@ uv run python -m glosskernels.harness --panel hospital --project 2 --voices seas
 | `pooled:tabicl` | the panel's recent rows, each series in its own units | the default ensemble (`band_grid`) |
 | `walk:nori`, `pooled:nori` | the same two contexts | Synthefy Nori (Apache-2.0) |
 | `chronos2` | each series alone, as a series | Chronos-2 (Apache-2.0) |
-| `cal:<voice>` | the voice's own landed PITs, the panel's together | the voice, its bands re-read at the levels its record puts them |
+| `seasonal:tabicl` | one series' months, rows anchored on the same month in the last years known — for calls further out | the pinned member |
+| `blend:<voice>+<voice>` | its voices' | the mean of their quantiles, level by level |
+| `cal:<voice>` | the voice's own landed PITs, the panel's together | the voice, its bands re-read at the levels its record puts them, per horizon |
 
 Panels: `tourism_monthly`, `hospital`, `car_parts` (the Monash archive
 from the hub) and `synthetic` (no network). Nori wants torch

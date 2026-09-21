@@ -51,17 +51,28 @@ def walk(panel: Panel, voices: list, months: int = 6, burn: int = 0) -> dict:
     return out
 
 
-def project(panel: Panel, voices: list, origins: int = 2, horizon: int = 12) -> dict:
+def project(panel: Panel, voices: list, origins: int = 2, horizon: int = 12, burn: int = 0) -> dict:
     """Projections: from each origin (a year apart, the last one a year
     before the panel ends) every month out to `horizon`, and the total
     over those months two ways. `total_summed` adds the monthly bands up
     — what a plan built from monthly bands does, and right only if every
     month misses the same way at once. `total_direct` calls the total as
     its own series: the trailing `horizon`-month sum, read `horizon`
-    months out — the cube's own cell for the year."""
+    months out — the cube's own cell for the year.
+
+    `burn` calls the scored horizons and the direct total from that many
+    monthly origins first, unscored, the last of them early enough that
+    its furthest call has landed by the first scored origin — the record
+    a calibrated voice reads each horizon through."""
     total = panel.y.shape[1]
     starts = [total - horizon * (o + 1) for o in reversed(range(origins))]
     rolling = trailing_sum(panel.y, horizon)
+    scored_at = sorted({1, 3, 6, horizon} & set(range(1, horizon + 1)))
+    for t in range(starts[0] - horizon - burn + 1, starts[0] - horizon + 1):
+        for v in voices:
+            for h in scored_at:
+                v.step(panel.y[:, :t], panel.moy[: t + h], GRID, h)
+            v.step(rolling[:, :t], panel.moy[: t + horizon], GRID, horizon)
 
     shape = (panel.y.shape[0], origins)
     monthly = {v.name: np.full((*shape, horizon, len(GRID)), np.nan) for v in voices}
@@ -76,8 +87,8 @@ def project(panel: Panel, voices: list, origins: int = 2, horizon: int = 12) -> 
             direct[v.name][:, o] = v.step(rolling[:, :t], panel.moy[: t + horizon], GRID, horizon)
             seconds[v.name] += time.perf_counter() - start
 
-    out = {"panel": panel.name, "series": int(shape[0]), "origins": origins, "horizon": horizon, "voices": {}}
-    reads = {f"h{h}": None for h in sorted({1, 3, 6, horizon}) if h <= horizon}
+    out = {"panel": panel.name, "series": int(shape[0]), "origins": origins, "horizon": horizon, "burn": burn, "voices": {}}
+    reads = [f"h{h}" for h in scored_at]
     for name in monthly:
         out["voices"][name] = {"s": round(seconds[name], 1)}
     for key in reads:

@@ -56,6 +56,32 @@ def recipe(v: np.ndarray, moy: np.ndarray, h: int = 1) -> tuple[np.ndarray, np.n
     return feats, v[h:]
 
 
+def seasonal_recipe(v: np.ndarray, moy: np.ndarray, h: int = 1) -> tuple[np.ndarray, np.ndarray]:
+    """Rows for a call further out, where the last known month is the
+    wrong anchor — it is another season. The month is placed against the
+    same month in the last year or two known, and against where the
+    level has gone since: the mean of the last twelve known months, and
+    of the twelve before them. Same shapes as `recipe`; nothing in a row
+    is later than `h` months before its label."""
+    n = v.shape[0]
+    feats = np.full((n, 7), np.nan)
+    back = 12 * int(np.ceil(h / 12))  # the same month, the last time it was known
+    with np.errstate(all="ignore"):
+        for i in range(h, n + h):
+            known = i - h + 1
+            year, before = v[max(0, known - 12) : known], v[max(0, known - 24) : max(0, known - 12)]
+            feats[i - h] = [
+                i,
+                moy[i],
+                v[i - back] if i >= back else np.nan,
+                v[i - back - 12] if i >= back + 12 else np.nan,
+                np.nanmean(year) if np.isfinite(year).any() else np.nan,
+                np.nanmean(before) if np.isfinite(before).any() else np.nan,
+                v[known - 1],
+            ]
+    return feats, v[h:]
+
+
 def _filled(train_x: np.ndarray, test_x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Absent features take the training rows' median; one absent
     throughout takes 0.0."""
@@ -121,8 +147,8 @@ class SeasonalNaive:
 class Walk:
     """The graded protocol: each series alone, its own months the context."""
 
-    def __init__(self, name: str, backend: Backend):
-        self.name, self.backend = name, backend
+    def __init__(self, name: str, backend: Backend, rows=recipe):
+        self.name, self.backend, self.rows = name, backend, rows
 
     def step(self, y, moy, alphas, h=1):
         out = np.full((y.shape[0], len(alphas)), np.nan)
@@ -130,7 +156,7 @@ class Walk:
             v = _trim(y[s])
             if v.shape[0] < h + MIN_TRAIN:
                 continue
-            feats, labels = recipe(v, moy[moy.shape[0] - v.shape[0] - h :], h)
+            feats, labels = self.rows(v, moy[moy.shape[0] - v.shape[0] - h :], h)
             known = ~np.isnan(labels)
             if known.sum() < MIN_TRAIN:
                 continue
@@ -232,33 +258,37 @@ class Calibrated:
     """A voice read through its own record. Each answer is kept; once
     the month it called has landed, the PIT of the actual against it
     joins the voice's history — the panel's, every series together, as
-    a metric's own six walked months say too little alone. A band at
-    alpha is then the raw quantile at the level the past PITs put alpha
-    at: a voice whose 90s held four times in five is read further out.
+    a metric's own six walked months say too little alone — kept apart
+    per horizon, since a voice honest a month out may be narrow a year
+    out. A band at alpha is then the raw quantile at the level the past
+    PITs put alpha at: a voice whose 90s held four times in five is read
+    further out.
 
     Point in time by construction: an origin's PITs come only from
-    months already in the `y` it was handed. It reads the first month
-    out; further horizons pass through. Until `min_history` PITs have
-    landed the voice speaks raw. What lies outside the raw grid's ends
-    cannot be reached — a voice too narrow past its first percentile
-    stays so."""
+    months already in the `y` it was handed. Until `min_history` PITs
+    have landed at a horizon the voice speaks raw there. What lies
+    outside the raw grid's ends cannot be reached — a voice too narrow
+    past its first percentile stays so."""
 
     def __init__(self, inner, min_history: int = 100):
         self.inner, self.name, self.min_history = inner, f"cal:{inner.name}", min_history
-        self._pending: dict[int, np.ndarray] = {}  # origin t -> the raw answer for month t
-        self._pits: list[np.ndarray] = []
+        self._pending: dict[tuple, np.ndarray] = {}  # (panel, h, origin) -> the raw answer
+        self._pits: dict[tuple, list[np.ndarray]] = {}  # (panel, h) -> landed PITs
 
     def step(self, y, moy, alphas, h=1):
         raw = self.inner.step(y, moy, alphas, h)
-        if h != 1:
-            return raw
         t = y.shape[1]
-        for origin in sorted(o for o in self._pending if o < t):
-            answer, actual = np.sort(self._pending.pop(origin), axis=1), y[:, origin]
+        # A panel is known by its first two years — the same under every
+        # origin, and what tells the months from their trailing sums.
+        panel = y[:, :24].tobytes()
+        for key in sorted(k for k in self._pending if k[0] == panel and k[2] + k[1] - 1 < t):
+            answer, actual = np.sort(self._pending.pop(key), axis=1), y[:, key[2] + key[1] - 1]
             landed = ~np.isnan(actual) & ~np.isnan(answer).any(axis=1)
-            self._pits.append((answer[landed] <= actual[landed, None]).sum(axis=1) / (answer.shape[1] + 1))
-        self._pending[t] = raw
-        pits = np.concatenate(self._pits) if self._pits else np.zeros(0)
+            pits = (answer[landed] <= actual[landed, None]).sum(axis=1) / (answer.shape[1] + 1)
+            self._pits.setdefault(key[:2], []).append(pits)
+        self._pending[(panel, h, t)] = raw
+        history = self._pits.get((panel, h))
+        pits = np.concatenate(history) if history else np.zeros(0)
         if pits.shape[0] < self.min_history:
             return raw
         levels = np.quantile(pits, alphas)
@@ -268,12 +298,26 @@ class Calibrated:
         return out
 
 
+class Blend:
+    """Several voices as one: the mean of their quantiles, level by
+    level — each voice's band ends averaged, which keeps a band a band
+    (averaging the distributions instead would only ever widen it)."""
+
+    def __init__(self, voices: list):
+        self.voices, self.name = voices, "blend:" + "+".join(v.name for v in voices)
+
+    def step(self, y, moy, alphas, h=1):
+        return np.mean([np.sort(v.step(y, moy, alphas, h), axis=1) for v in self.voices], axis=0)
+
+
 def build(names: list[str]) -> list:
-    """Voices by name, `cal:<voice>` for one read through its own record;
-    one whose package is not installed says so."""
+    """Voices by name: `cal:<voice>` for one read through its own record,
+    `blend:<voice>+<voice>` for several as one, and `cal:blend:…` for
+    both. One whose package is not installed says so."""
     makers = {
         "seasonal_naive": SeasonalNaive,
         "walk:tabicl": lambda: Walk("walk:tabicl", tabicl(ensemble=False)),
+        "seasonal:tabicl": lambda: Walk("seasonal:tabicl", tabicl(ensemble=False), rows=seasonal_recipe),
         "pooled:tabicl": lambda: Pooled("pooled:tabicl", tabicl(ensemble=True)),
         "walk:nori": lambda: Walk("walk:nori", nori()),
         "pooled:nori": lambda: Pooled("pooled:nori", nori()),
@@ -291,4 +335,13 @@ def build(names: list[str]) -> list:
                 raise SystemExit(f"{name}: {e} — `uv sync --group harness`") from e
         return raw[name]
 
-    return [Calibrated(once(n[4:])) if n.startswith("cal:") else once(n) for n in names]
+    def named(name: str):
+        if name.startswith("cal:"):
+            return Calibrated(named(name[4:]))
+        if name.startswith("blend:"):
+            if name not in raw:
+                raw[name] = _Once(Blend([named(part) for part in name[6:].split("+")]))
+            return raw[name]
+        return once(name)
+
+    return [named(n) for n in names]
