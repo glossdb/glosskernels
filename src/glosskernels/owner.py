@@ -85,7 +85,10 @@ class Owner:
     # -- the callers' side ---------------------------------------------------
 
     def bands(self, caller: str, reads: list, alphas: list[float], members: int) -> Future:
-        cells = members * sum(r[0].size + r[2].size for r in reads)
+        """`reads` are `kernels.Read`s; each is answered (quantiles, raw grid, context id)."""
+        for read in reads:
+            read.caller = caller
+        cells = members * sum(r.test_x.size + (0 if r.train_x is None else r.train_x.size) for r in reads)
         return self._admit(_Job(caller, "bands", cells, Future(), reads, tuple(alphas), members))
 
     def exclusive(self, caller: str, name: str, cells: int, run: Callable[[Any], Any]) -> Future:
@@ -177,7 +180,7 @@ class Owner:
             return
         reads = [read for job in jobs for read in job.reads]
         alphas = [job.alphas for job in jobs for _ in job.reads]
-        answers = kernel.bands_many(reads, alphas, jobs[0].members, refusals=True)
+        answers = kernel.answer(reads, alphas, jobs[0].members)
         at = 0
         for job in jobs:
             mine = answers[at : at + len(job.reads)]
@@ -186,7 +189,10 @@ class Owner:
             if refusal is not None:
                 # Its index was the cycle's; say the caller's own.
                 local = next(i for i, a in enumerate(mine) if a is refusal)
-                text = str(refusal).split(": ", 2)[-1]
+                text = str(refusal)
+                if text.startswith("bands: read "):
+                    text = text.split(": ", 2)[-1]
+                text = text.removeprefix("bands: ")
                 job.future.set_exception(type(refusal)(f"bands: read {local}: {text}"))
             else:
                 job.future.set_result(mine)

@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -31,6 +32,7 @@ import torch
 from huggingface_hub import hf_hub_download
 from tabicl import TabICLRegressor, TabICLUnsupervised
 
+from .contexts import Contexts, ContextUnknown, Held, budget_bytes, context_id
 from .prepare import prepare_many, warm
 
 HUB_REPO = "jingang/TabICL"
@@ -41,10 +43,31 @@ REGRESSOR = "tabicl-regressor-v2-20260212.ckpt"
 # walk-sized tables, and a pass is kept under a cell budget as tables grow.
 _TABLES_PER_PASS = 256
 _CELLS_PER_PASS = 4_000_000
+# Precision is the kernel's business. Small reads are float32: exact, and
+# faster (autocast's casts outweigh the arithmetic on a small table, and
+# there float16 is percent-level wrong one fit in a hundred). A kept
+# context of this many rows or more is built in float16 on CUDA, where it
+# is half the memory and a third of the build: measured on an L4 at 5k
+# and 20k rows x 8 members, within 0.0024 of the float32 read in units of
+# the target's spread at worst, 0.0006 at the median.
+_HALF_FROM_ROWS = 5000
 
 
 class KernelError(Exception):
     """A read the kernel refuses, with the reason the door reports."""
+
+
+@dataclass
+class Read:
+    """One band read: query rows against context rows — the rows
+    themselves, or the id of a context this caller had kept."""
+
+    test_x: np.ndarray
+    train_x: np.ndarray | None = None
+    train_y: np.ndarray | None = None
+    context: str | None = None  # in place of the rows
+    cache: bool = False  # keep this read's context for later reads
+    caller: str = "open"
 
 
 def fetch_checkpoints() -> None:
@@ -128,13 +151,91 @@ class Kernels:
         loader._load_model()
         loader.model_.to(loader.device_)
         self.model = loader.model_
+        self.contexts = Contexts(budget_bytes(self.device))
 
     def _regressor(self, **kwargs: Any) -> _Regressor:
-        est = _Regressor(device=self.device, use_amp=self.use_amp, **kwargs)
+        kwargs.setdefault("use_amp", self.use_amp)
+        est = _Regressor(device=self.device, **kwargs)
         est.model_ = self.model
         return est
 
     # -- the reads --------------------------------------------------------
+
+    def answer(
+        self, reads: list[Read], alphas: list[list[float]], members: int = 1
+    ) -> list[tuple[np.ndarray, np.ndarray, str | None] | Exception]:
+        """Every read of a cycle, each answered as (quantiles, raw grid,
+        context id or None) or with its refusal in place. Reads that
+        bring their rows and keep nothing ride the forward passes
+        together; a read against a kept context costs only its query
+        rows; a read asking to be kept builds its context once (the
+        same rows again find it) and is answered from it."""
+        out: list = [None] * len(reads)
+        plain = [i for i, r in enumerate(reads) if r.context is None and not r.cache]
+        if plain:
+            served = self.bands_many(
+                [(reads[i].train_x, reads[i].train_y, reads[i].test_x) for i in plain],
+                [alphas[i] for i in plain],
+                members,
+                refusals=True,
+            )
+            for i, got in zip(plain, served):
+                out[i] = got if isinstance(got, Exception) else (got[0], got[1], None)
+        for i, read in enumerate(reads):
+            if out[i] is not None:
+                continue
+            try:
+                id_ = read.context or self._keep(read, members)
+                held = self.contexts.get(read.caller, id_)
+                if read.test_x.ndim != 2 or read.test_x.shape[1] != held.cols:
+                    raise KernelError(f"bands: test rows of shape {read.test_x.shape} against a context of {held.cols} features")
+                got = held.fitted.predict(read.test_x, output_type=["quantiles", "raw_quantiles"], alphas=list(alphas[i]))
+                n = read.test_x.shape[0]
+                out[i] = (
+                    np.asarray(got["quantiles"], dtype=np.float64).reshape(n, len(alphas[i])),
+                    np.asarray(got["raw_quantiles"], dtype=np.float64).reshape(n, -1),
+                    id_,
+                )
+            except (KernelError, ContextUnknown) as e:
+                out[i] = e
+            except Exception as e:  # the package's own refusals, by their text
+                out[i] = KernelError(f"bands: {e}")
+        return out
+
+    def _keep(self, read: Read, members: int) -> str:
+        """The read's context, built and kept unless this caller already has it."""
+        rows, cols = read.train_x.shape
+        if rows < 2 or read.train_y.shape[0] != rows:
+            raise KernelError(f"bands: {rows} train rows x {cols} features against {read.train_y.shape[0]} train values")
+        id_ = context_id(read.train_x, read.train_y, members, REGRESSOR)
+        if self.contexts.has(read.caller, id_):
+            return id_
+        half = self.use_amp or (self.device == "cuda" and rows >= _HALF_FROM_ROWS)
+        # What the package keeps: keys and values of every training row, at
+        # each of the ICL stack's 12 layers, 512 wide, per member.
+        estimate = rows * members * 12 * 2 * 512 * (2 if half else 4)
+        if not self.contexts.fits(estimate):
+            raise KernelError(
+                f"bands: a context of {rows} rows x {members} members keeps ~{estimate >> 20} MB and a caller's "
+                f"share of the cache is {int(self.contexts.budget * self.contexts.caller_share) >> 20} MB — "
+                "fewer members, or send it without `cache`"
+            )
+        if members == 1:
+            est = self._regressor(
+                n_estimators=1, norm_methods="none", feat_shuffle_method="none", random_state=0, kv_cache="kv", use_amp=half
+            )
+        else:
+            est = self._regressor(n_estimators=members, random_state=0, kv_cache="kv", use_amp=half)
+        try:
+            est.fit(read.train_x, read.train_y)
+        except torch.OutOfMemoryError as e:
+            del est
+            if self.device == "cuda":
+                torch.cuda.empty_cache()
+            raise KernelError(f"bands: the device ran out of memory building a {rows}-row context: {e}") from e
+        nbytes = sum(c.cache_size_mb() + 1 for c in est.model_kv_cache_.values()) << 20
+        self.contexts.put(read.caller, id_, Held(est, nbytes, rows, cols))
+        return id_
 
     def bands(self, train_x, train_y, test_x, alphas, members: int = 1) -> tuple[np.ndarray, np.ndarray]:
         """One read: quantiles (test rows x alphas) and the raw quantile

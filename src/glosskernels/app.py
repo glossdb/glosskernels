@@ -27,6 +27,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from . import calibration, kernels
+from .contexts import ContextUnknown
 from .owner import Busy, Owner, TooLarge
 
 # Handlers never touch the model: one owner per device takes what is
@@ -162,6 +163,8 @@ def _door(read):
             return JSONResponse({"error": str(e)}, status_code=429, headers={"Retry-After": str(e.retry_after)})
         except TooLarge as e:
             return JSONResponse({"error": str(e)}, status_code=413)
+        except ContextUnknown as e:
+            return JSONResponse({"error": str(e)}, status_code=404)
         except kernels.KernelError as e:
             return JSONResponse({"error": str(e)}, status_code=422)
 
@@ -176,7 +179,11 @@ class Bands:
     `members` is 1 for the pinned member and more for the ensemble. A
     read's `actual` (per test row, null where none) gets its PIT back,
     always against the raw answer; `salt` names the points for the draw
-    that places a tied actual. With `pit_history` (a hundred counts of
+    that places a tied actual. A read with `cache` has its context
+    kept and its id returned as `context`; a later read sends that id in
+    place of the rows and pays only for its query rows — until the
+    context ages out, when the answer is a 404 and the rows are sent
+    again. With `pit_history` (a hundred counts of
     past PITs, zeros for a caller with none yet) the `quantiles` are
     read through that record and the kernel's default one, and `raw`
     carries the answer as the model spoke it."""
@@ -198,7 +205,14 @@ class Bands:
         for i, read in enumerate(reads):
             if not isinstance(read, dict):
                 raise Refusal(f"read {i} is a JSON object", 400)
-            one = {name: _matrix(read, name, ndim=ndim) for name, ndim in (("train_x", 2), ("train_y", 1), ("test_x", 2))}
+            one = {"test_x": _matrix(read, "test_x", ndim=2), "context": read.get("context"), "cache": read.get("cache", False)}
+            if one["context"] is not None:
+                if not isinstance(one["context"], str) or "train_x" in read or "train_y" in read:
+                    raise Refusal(f"read {i}: `context` is an id this service gave, in place of `train_x` and `train_y`", 400)
+            else:
+                one |= {"train_x": _matrix(read, "train_x", ndim=2), "train_y": _matrix(read, "train_y", ndim=1)}
+            if not isinstance(one["cache"], bool):
+                raise Refusal(f"read {i}: `cache` is true or false", 400)
             for name in ("actual", "salt"):
                 one[name] = _matrix(read, name, ndim=1) if read.get(name) is not None else None
                 if one[name] is not None and one[name].shape[0] != one["test_x"].shape[0]:
@@ -213,9 +227,12 @@ class Bands:
             read_at = calibration.levels(alphas, history, calibration.default_record("tabicl"))
             asked += np.clip(read_at, 0.001, 0.999).tolist()
         answers = []
-        waiting = own.bands(caller, [(r["train_x"], r["train_y"], r["test_x"]) for r in reads], asked, members)
-        served = await asyncio.wrap_future(waiting)
-        for read, (quantiles, grid) in zip(reads, served):
+        asking = [
+            kernels.Read(r["test_x"], r.get("train_x"), r.get("train_y"), context=r["context"], cache=r["cache"])
+            for r in reads
+        ]
+        served = await asyncio.wrap_future(own.bands(caller, asking, asked, members))
+        for read, (quantiles, grid, context) in zip(reads, served):
             answer = {"quantiles": quantiles[:, : len(alphas)]}
             if history is not None:
                 answer = {"quantiles": np.sort(quantiles[:, len(alphas) :], axis=1), "raw": answer["quantiles"]}
@@ -225,6 +242,8 @@ class Bands:
                 salt = None if read["salt"] is None else read["salt"][landed].astype(np.int64)
                 pit[landed] = calibration.pit(grid[landed], read["actual"][landed], salt)
                 answer["pit"] = pit
+            if context is not None:
+                answer["context"] = context
             answers.append(answer)
         return {"reads": answers}
 

@@ -8,17 +8,23 @@ import pytest
 
 from glosskernels import app as app_module
 from glosskernels import kernels
+from glosskernels.contexts import ContextUnknown
 
 
 class Fake:
     device = "fake"
 
-    def bands_many(self, reads, alphas, members, refusals=False):
+    def answer(self, reads, alphas, members):
         # Each quantile is its own level plus the member count; the grid is 1..9.
-        return [
-            (np.tile(np.asarray(levels) + members, (test_x.shape[0], 1)), np.tile(np.arange(1.0, 10.0), (test_x.shape[0], 1)))
-            for (_train_x, _train_y, test_x), levels in zip(reads, alphas)
-        ]
+        out = []
+        for read, levels in zip(reads, alphas):
+            if read.context == "gone":
+                out.append(ContextUnknown("context_unknown: gone is not held here — send the rows again"))
+                continue
+            n = read.test_x.shape[0]
+            kept = read.context or ("kept-for-" + read.caller if read.cache else None)
+            out.append((np.tile(np.asarray(levels) + members, (n, 1)), np.tile(np.arange(1.0, 10.0), (n, 1)), kept))
+        return out
 
     def misfit(self, x):
         return np.array([0.1, float("nan")])
@@ -127,3 +133,14 @@ def test_a_body_over_the_cap_is_refused_before_it_is_parsed(client, monkeypatch)
     monkeypatch.setattr(app_module, "MAX_BODY_MB", 0)
     r = client.post("/bands", json={"alphas": [0.5], "reads": [READ]})
     assert r.status_code == 413 and "in parts" in r.json()["error"]
+
+
+def test_a_kept_context_is_named_and_read_by_its_id(client):
+    r = client.post("/bands", json={"alphas": [0.5], "reads": [READ | {"cache": True}]})
+    assert r.status_code == 200 and r.json()["reads"][0]["context"] == "kept-for-open"
+    r = client.post("/bands", json={"alphas": [0.5], "reads": [{"context": "kept-for-open", "test_x": [[1, 2]]}]})
+    assert r.status_code == 200 and r.json()["reads"][0] == {"quantiles": [[1.5]], "context": "kept-for-open"}
+    r = client.post("/bands", json={"alphas": [0.5], "reads": [{"context": "gone", "test_x": [[1, 2]]}]})
+    assert r.status_code == 404 and "context_unknown" in r.json()["error"]
+    r = client.post("/bands", json={"alphas": [0.5], "reads": [READ | {"context": "x"}]})
+    assert r.status_code == 400 and "in place of" in r.json()["error"]

@@ -108,6 +108,15 @@ def batching(use_amp: bool = False, flushing_probe: bool = False) -> list:
     return [*run(k), callers(k)]
 
 
+@app.function(gpu=GPU, cpu=CPU, region=REGION, timeout=1800)
+def kept() -> list:
+    """The context cache: build, query, and fp16 against fp32 (glosskernels.measure.kept)."""
+    from glosskernels.kernels import Kernels
+    from glosskernels.measure import kept as run
+
+    return run(Kernels())
+
+
 @app.function(gpu=GPU, cpu=CPU, region=REGION, timeout=1200)
 def parity(use_amp: bool = False, bf16: bool = False, flushing_probe: bool = False) -> dict:
     """The pinned-oracle parity numbers on this GPU (glosskernels.parity)."""
@@ -126,7 +135,12 @@ def main(
     bf16: bool = False,
     check_batching: bool = False,
     flushing_probe: bool = False,
+    check_kept: bool = False,
 ):
+    if check_kept:
+        for row in kept.remote():
+            print(row)
+        return
     if check_batching:
         for row in batching.remote(use_amp=amp, flushing_probe=flushing_probe):
             print(row)

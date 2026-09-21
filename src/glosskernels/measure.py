@@ -194,6 +194,7 @@ def callers(k: Kernels, clients: int = 16, requests: int = 8, points: int = 6) -
     row a month). One after another, as a service answering a request at
     a time would; then through the owner's queue, where what is waiting
     rides together."""
+    from .kernels import Read
     from .owner import Owner
 
     rng = np.random.default_rng(4)
@@ -224,7 +225,7 @@ def callers(k: Kernels, clients: int = 16, requests: int = 8, points: int = 6) -
         worst = 0.0
         for reads in work[i]:
             t0 = time.perf_counter()
-            own.bands(f"caller-{i}", reads, ALPHAS, 1).result()
+            own.bands(f"caller-{i}", [Read(q, x, y) for x, y, q in reads], ALPHAS, 1).result()
             worst = max(worst, time.perf_counter() - t0)
         return worst
 
@@ -242,6 +243,55 @@ def callers(k: Kernels, clients: int = 16, requests: int = 8, points: int = 6) -
         "cycles": own.stats["cycles"],
         "largest_cycle_jobs": own.stats["largest_cycle_jobs"],
     }
+    return out
+
+
+def kept(k: Kernels, rows_list: tuple[int, ...] = (5000, 20000), members: int = 8, cols: int = 20, queries: int = 100) -> list[dict]:
+    """The context cache as the service runs it (`Kernels.answer`): the
+    build, a query by id, and how far the kept read stands from the fp32
+    read of the rows — in float32, and in float16 where the cache is
+    half the size. Deviations are in units of the target's spread."""
+    from .kernels import Read
+
+    rng = np.random.default_rng(5)
+    k.contexts.budget = 1 << 50  # measure the device, not the budget
+    out = []
+    for rows in rows_list:
+        x, q = rng.normal(size=(rows, cols)), rng.normal(size=(queries, cols))
+        y = x[:, 0] - 0.5 * x[:, 1] * x[:, 2] + rng.normal(scale=0.5, size=rows)
+        entry: dict = {"rows": rows, "members": members}
+        k.use_amp = False
+        (reference,) = k.answer([Read(q, x, y)], [ALPHAS], members)
+        for name, amp in (("fp32", False), ("fp16", True)):
+            k.use_amp = amp
+            k.contexts.drop("measure")
+            try:
+                if k.device == "cuda":
+                    torch.cuda.empty_cache()
+                t = time.perf_counter()
+                (built,) = k.answer([Read(q, x, y, cache=True, caller="measure")], [ALPHAS], members)
+                _sync(k)
+                if isinstance(built, Exception):
+                    raise built
+                build_s = time.perf_counter() - t
+                t = time.perf_counter()
+                for _ in range(5):
+                    (got,) = k.answer([Read(q, context=built[2], caller="measure")], [ALPHAS], members)
+                _sync(k)
+                dev = np.abs(got[0] - reference[0]).max(axis=1) / float(np.std(y))
+                entry[name] = {
+                    "build_s": round(build_s, 2),
+                    "query_s": round((time.perf_counter() - t) / 5, 3),
+                    "cache_mb": k.contexts.of("measure") >> 20,
+                    "dev_median": float(np.median(dev)),
+                    "dev_p99": float(np.quantile(dev, 0.99)),
+                    "dev_max": float(dev.max()),
+                }
+            except Exception as e:
+                entry[name] = {"error": f"{type(e).__name__}: {str(e)[:160]}"}
+        k.use_amp = False
+        k.contexts.drop("measure")
+        out.append(entry)
     return out
 
 
