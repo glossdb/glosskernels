@@ -325,10 +325,13 @@ entity scoring · synthetic twins.
       failures as JSON 500s, non-root, SIGTERM to the process, the commit
       baked, tests in CI. Modal removed; the bench is `python -m
       glosskernels.measure` on any GPU host.
-- [ ] The first deploy (the deployment repo): Cloud Build from the
-      Dockerfile, the Cloud Run service scaled to zero with the collector
-      sidecar, IAM and ingress; then measure the cold start end to end and
-      the first real walk's cost.
+- [x] The image from the repo: `ghcr.io/glossdb/glosskernels:<version>`
+      at a `v*` tag, `:sha-<commit>` from a dispatch, the version baked;
+      started on the runner and asked `/healthz` before it is pushed.
+- [ ] The first deploy (the deployment repo): the Cloud Run service from
+      that image, scaled to zero with the collector sidecar, IAM and
+      ingress; then measure the cold start end to end and the first real
+      walk's cost.
 - [x] A failed cycle hands the device's memory back and does not feed the
       rate; the body cap is 32 MB (JSON parses to several times its text);
       SIGTERM finishes what is in flight and sends new requests back to

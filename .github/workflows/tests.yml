@@ -1,5 +1,5 @@
 # The wire and the parity against the pinned fixtures, on CPU, on every push.
-# The image is built where it is deployed (Cloud Build, from the Dockerfile).
+# The image is release.yml's: built at a v* tag, pushed to GHCR.
 name: tests
 on:
   push:
