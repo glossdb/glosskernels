@@ -239,10 +239,11 @@ plan, so the skill lands with the door, not before it.
 5. **The calendar's home.** A shipped function over a region named in
    `conventions`, offline and deterministic; its worth at monthly grain is
    unmeasured and is each dataset's backtest to show.
-6. **Its own skill, or a page of `glossql-metrics`.** Proposed: its own, for
-   the reasons above; the page is the smaller change.
-7. **How much of the order the `next` routes carry.** Proposed: walk before
-   read, and the floor said before the future. More than that is prose.
+
+Decided by the project lead: the skill is its own, `skills/glossql-forecast`,
+to be extended over time; the `next` routes carry walk-before-read and the
+floor said before the future, and no more; and the forecast door comes
+after the metric foundation (the seven goals) stands.
 
 ## What the kernel still owes
 
