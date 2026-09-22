@@ -250,11 +250,21 @@ collector, who may call) lives in the private deployment repo.
 
 - **Scaled to zero, not kept warm.** A warm L4 around the clock is the
   price of an L4-hour around the clock, for a service whose day is a
-  handful of walks. Cloud Run bills the seconds a request is in flight;
-  the cost is the cold start, which the caller waits out (glossql's
-  call timeout is 600 s). The model loads before the port opens, so the
-  port is the readiness signal, and the checkpoint load is 6–11 s; the
-  image pull in front of it is the number to measure on the first deploy.
+  handful of walks. A GPU service on Cloud Run is billed by instance
+  time (start to scale-down after idle), never by request, so a walk
+  costs the minutes its instance lives, not a day; the price is the cold
+  start, which the caller waits out (glossql's call timeout is 600 s).
+  The model loads before the port opens, so the port is the readiness
+  signal, and the checkpoint load is 6–11 s; the image pull in front of
+  it is the number to measure on the first deploy.
+- **CUDA from the wheels, the driver from the host.** The image has no
+  CUDA base: torch's wheels carry the runtime libraries (CUDA 13.0 in the
+  lock), and Cloud Run mounts its driver (580, CUDA 13.0) into the
+  container. A lock that moves torch past the driver's CUDA needs a
+  forward-compatibility package or a driver bump — check on every torch
+  move. Free-threaded Python, when shapes side by side is taken up, is
+  `uv python install 3.14t` in the same image (torch ships cp314t Linux
+  wheels), not another base.
 - **One instance.** `max-instances 1` until 429s say otherwise: a second
   instance halves cache hits, since Cloud Run does not route by context
   id. Container concurrency stays high; the service's own queue pushes
