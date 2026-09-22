@@ -28,6 +28,8 @@ from typing import Any, Callable
 
 import numpy as np
 
+from . import telemetry
+
 BYTES_PER_CELL = 8  # the reads wait as float64
 
 
@@ -78,9 +80,9 @@ class Owner:
         self._cells_of: dict[str, int] = {}
         self._rate = 0.0  # cells answered per second, smoothed
         self._wake = threading.Condition()
+        self.stats = {"cycles": 0, "jobs": 0, "refused_busy": 0, "largest_cycle_jobs": 0, "failed": 0, "last_cycle_at": None}
         self._thread = threading.Thread(target=self._loop, daemon=True, name="gpu-owner")
         self._thread.start()
-        self.stats = {"cycles": 0, "jobs": 0, "refused_busy": 0, "largest_cycle_jobs": 0}
 
     # -- the callers' side ---------------------------------------------------
 
@@ -163,18 +165,33 @@ class Owner:
                     self._wake.wait()
                 jobs = self._take()
             started = time.perf_counter()
+            kind = jobs[0].kind
             try:
-                self._serve(jobs)
+                with telemetry.span("owner.cycle", kind=kind, jobs=len(jobs)):
+                    self._serve(jobs)
             except BaseException as e:  # the owner must outlive any one cycle
                 for job in jobs:
                     if not job.future.done():
                         job.future.set_exception(e)
+                self.stats["failed"] += 1
+                telemetry.failed(kind, len(jobs), e)
+            seconds = time.perf_counter() - started
             cells = sum(job.cells for job in jobs)
-            rate = cells / max(time.perf_counter() - started, 1e-6)
+            rate = cells / max(seconds, 1e-6)
             self._rate = rate if self._rate == 0 else 0.8 * self._rate + 0.2 * rate
             self.stats["cycles"] += 1
             self.stats["jobs"] += len(jobs)
             self.stats["largest_cycle_jobs"] = max(self.stats["largest_cycle_jobs"], len(jobs))
+            self.stats["last_cycle_at"] = time.time()
+            telemetry.cycle(
+                jobs=len(jobs),
+                reads=sum(len(job.reads) for job in jobs) or len(jobs),
+                cells=cells,
+                callers=len({job.caller for job in jobs}),
+                kind=kind,
+                seconds=seconds,
+                waiting_cells=self._cells,
+            )
 
     def _serve(self, jobs: list[_Job]) -> None:
         kernel = self._kernels_get()

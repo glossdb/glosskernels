@@ -18,7 +18,10 @@ GLOSSKERNELS_KEYS=k1 uv run glosskernels   # a bearer per caller
 |---|---|
 | `GLOSSKERNELS_ADDR` | where to listen; default `127.0.0.1:8100` |
 | `GLOSSKERNELS_DEVICE` | `cuda`, `mps` or `cpu`; default the first available in that order |
-| `GLOSSKERNELS_KEYS` | comma-separated bearer keys; unset serves open (a laptop, or a host that authenticates in front) |
+| `GLOSSKERNELS_AUDIENCE`, `GLOSSKERNELS_CALLERS` | the doors take Google-signed ID tokens for that audience (the service's URL) from the listed service accounts — what a caller on GCP mints from its metadata server, no key anywhere; the `auth` extra |
+| `GLOSSKERNELS_KEYS` | comma-separated bearer keys instead (a laptop, a test host); neither set serves open |
+| `GLOSSKERNELS_VERSION` | the build's name, on `/healthz` and every log line; the image bakes the commit |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | a collector to send traces, metrics and logs to (OTLP/HTTP); unset, the JSON log lines on stdout are all; the `otel` extra |
 | `GLOSSKERNELS_QUEUE_MB` | what may wait for the GPU, in MB of reads; default 512, half of it at most one caller's — past it a `429` with `Retry-After` |
 | `GLOSSKERNELS_CACHE_MB` | device memory for kept contexts; default two fifths of the GPU (2 GB without one), half of it at most one caller's |
 | `GLOSSKERNELS_MAX_BODY_MB` | the largest body parsed; default 256 — past it a `413` |
@@ -39,7 +42,7 @@ by name.
 |---|---|---|
 | `POST /bands` | `alphas`, `reads` (each `train_x`, `train_y`, `test_x` rows × cols — or `context` in place of the train rows — and optionally `actual` and `salt` per test row, `cache`), `members`, `pit_history`, `window` | per read: `quantiles` (rows × alphas), `pit` where an actual was given, `raw` when a `pit_history` was, `context` when kept |
 | `POST /misfit` | `x` (rows × cols), `columns`, `folds` | `scores` (per row; log density, higher fits the frame better) and, with `columns: true`, `columns` (rows × cols; each column's share of the row's score — they sum to it, the lowest names the cell) |
-| `GET /healthz` | | `status`, `device`, `loaded` |
+| `GET /healthz` | | `status`, `version`, `device`, `loaded`, `owner` (its counters and the time of its last cycle) |
 
 With `voices` (`tabicl` and any of `chronos2`, `seasonal_naive`) each read
 also carries `history` — the series up to the origin — and optionally
@@ -59,18 +62,32 @@ row is scored from a context it is not in, at that many times the fits. The test
 the port repo's pinned oracle fixtures. Where this is going:
 `docs/deployment-design.md`.
 
-## Hosts
+## Hosting
 
-- Modal (`modal_app.py`): `uv run modal deploy modal_app.py` serves the
-  app behind a T4 in the EU with Modal's proxy auth; `uv run modal run
-  modal_app.py` prints the timings. With `--context-rows 5000,20000,100000`
-  the run adds what a shared instance turns on: a panel held as a cached
-  context (`repr` and `kv`) against refitting it per call, and the short
-  reads under concurrent callers with and without the service's lock.
-  `GLOSSKERNELS_GPU=L4` names the GPU; `--amp` and `--check-parity` grade
-  reduced precision against the fixtures.
-- A container (`Dockerfile`): the same process on whatever GPU the
-  host has, CPU without one.
+One container (`Dockerfile`): the same process on whatever GPU the
+host has, CPU without one; not root, the checkpoints and the commit
+baked, SIGTERM reaching the process. Nothing in it names a provider.
+Production is GCP (`docs/deployment-design.md`); the deployment — the
+project, the region, the collector sidecar, who may call — lives in the
+private deployment repo, not here.
+
+What the service says about itself (`telemetry.py`): a JSON line on
+stdout per start, per owner cycle (jobs, reads, cells, callers, device
+seconds, what still waits), per refusal (status, caller, route, reason)
+and per failure (with the traceback) — never a payload. A host that
+keeps stdout has that as-is; with `OTEL_EXPORTER_OTLP_ENDPOINT` the same
+goes to a collector as spans (per request, per cycle), counters
+(reads, cycles, refusals by status, failures), a histogram of cycle
+seconds and a gauge of the queue.
+
+The bench, on any host with a GPU that runs the container:
+
+```bash
+python -m glosskernels.measure                        # the reads' timings, this device
+python -m glosskernels.measure --context-rows 5000,20000,100000   # cached contexts, concurrent callers
+python -m glosskernels.measure --parity fixtures/     # the pinned oracle here; --amp, --bf16 grade reduced precision
+python -m glosskernels.measure --batching             # small reads riding one pass; --kept the context cache
+```
 
 ## The harness
 

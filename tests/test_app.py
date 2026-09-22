@@ -1,6 +1,8 @@
 """The wire, without the model: nulls, shapes, keys, errors."""
 
+import json
 import os
+import time
 
 import httpx
 import numpy as np
@@ -123,9 +125,60 @@ def test_keys_gate_when_set(client, monkeypatch):
     assert client.post("/misfit", json=body).status_code == 200
 
 
+def test_id_tokens_gate_by_audience_and_account(client, monkeypatch):
+    """With an audience set, only a verified token for it from a listed
+    account passes; the verifier is asked once per token until it expires."""
+    monkeypatch.setenv("GLOSSKERNELS_AUDIENCE", "https://kernel.example")
+    monkeypatch.setenv("GLOSSKERNELS_CALLERS", "glossql@proj.iam.gserviceaccount.com")
+    monkeypatch.setattr(app_module, "_TOKENS", {})
+    asked = []
+
+    def verify(token, audience):
+        asked.append(token)
+        assert audience == "https://kernel.example"
+        if token == "good":
+            return "glossql@proj.iam.gserviceaccount.com", time.time() + 3600
+        if token == "other":
+            return "someone@else.iam.gserviceaccount.com", time.time() + 3600
+        raise ValueError("not ours")
+
+    monkeypatch.setattr(app_module, "_verify_id_token", verify)
+    body = {"x": [[1, 2], [3, 4]]}
+    assert client.post("/misfit", json=body).status_code == 401
+    assert client.post("/misfit", json=body, headers={"authorization": "Bearer forged"}).status_code == 401
+    assert client.post("/misfit", json=body, headers={"authorization": "Bearer other"}).status_code == 401
+    assert client.post("/misfit", json=body, headers={"authorization": "Bearer good"}).status_code == 200
+    assert client.post("/misfit", json=body, headers={"authorization": "Bearer good"}).status_code == 200
+    assert asked == ["forged", "other", "good"]
+    # A shared key is not accepted once an audience is set.
+    monkeypatch.setenv("GLOSSKERNELS_KEYS", "k1")
+    assert client.post("/misfit", json=body, headers={"authorization": "Bearer k1"}).status_code == 401
+
+
+def test_a_failure_is_a_500_as_json_and_a_log_line(client, monkeypatch, capsys):
+    import logging
+
+    from glosskernels import telemetry
+
+    root = logging.getLogger()
+    monkeypatch.setattr(root, "handlers", list(root.handlers))
+    telemetry.configure("test")
+    monkeypatch.setattr(app_module.Misfit, "parse", staticmethod(lambda body: 1 / 0))
+    r = client.post("/misfit", json={"x": [[1, 2]]})
+    assert r.status_code == 500 and r.json() == {"error": "the kernel failed: ZeroDivisionError"}
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
+    failed = next(line for line in lines if line["event"] == "request_failed")
+    assert failed["severity"] == "ERROR" and failed["route"] == "/misfit" and "ZeroDivisionError" in failed["traceback"]
+    refused = next(line for line in lines if line["event"] == "refused")
+    assert refused["status"] == 500 and refused["caller"] == "open"
+
+
 def test_healthz(client):
     r = client.get("/healthz")
-    assert r.status_code == 200 and r.json()["device"] == "fake"
+    assert r.status_code == 200 and r.json()["device"] == "fake" and r.json()["version"] == "dev"
+    client.post("/misfit", json={"x": [[1, 2], [3, 4]]})
+    own = client.get("/healthz").json()["owner"]
+    assert own["cycles"] == 1 and own["jobs"] == 1 and own["last_cycle_at"] > 0 and own["waiting_cells"] == 0
 
 
 def test_a_full_queue_answers_429_with_retry_after(client, monkeypatch):

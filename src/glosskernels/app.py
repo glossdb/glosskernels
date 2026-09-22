@@ -4,10 +4,20 @@ One route per kind of read — `/bands` and `/misfit` — matrices as nested
 lists, a null where the caller has NaN. Nothing here knows about datasets,
 metrics or actors — a request is numbers and a key.
 
-Authentication: when `GLOSSKERNELS_KEYS` names one or more keys
-(comma-separated), a request must carry one as `Authorization: Bearer
-<key>`; unset, the doors are open (a laptop, or a host that
-authenticates in front — Modal's proxy auth). Same header either way.
+Authentication, by what is set — the same `Authorization: Bearer …`
+header either way, and the caller it names is whose share of the queue
+the request counts against:
+
+- `GLOSSKERNELS_AUDIENCE` and `GLOSSKERNELS_CALLERS`: a Google-signed ID
+  token for that audience (the service's own URL) from one of the listed
+  service accounts. That is what a caller on Cloud Run, GKE or a VM mints
+  from its metadata server for the URL it calls — no key anywhere. Cloud
+  Run checks the same token in front when the service requires
+  authentication; the service checks it again, so one left open by
+  mistake still refuses. The caller is the account's email.
+- `GLOSSKERNELS_KEYS`: shared bearer keys, comma-separated (a laptop, a
+  test host). The caller is the key.
+- neither: open (a laptop).
 """
 
 from __future__ import annotations
@@ -17,6 +27,7 @@ import json
 import math
 import os
 import threading
+import time
 from typing import Any
 
 import numpy as np
@@ -26,7 +37,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from . import calibration, kernels, voices
+from . import calibration, kernels, telemetry, voices
 from .voices import blend as voices_blend
 from .contexts import ContextUnknown
 from .owner import Busy, Owner, TooLarge
@@ -56,20 +67,66 @@ class Refusal(Exception):
         self.status = status
 
 
-def _keys() -> set[str]:
-    raw = os.environ.get("GLOSSKERNELS_KEYS", "")
+def _names(variable: str) -> set[str]:
+    raw = os.environ.get(variable, "")
     return {k.strip() for k in raw.split(",") if k.strip()}
 
 
+# Verified ID tokens, kept until they expire: Google's certificates are
+# not fetched per request. token -> (email, exp).
+_TOKENS: dict[str, tuple[str, float]] = {}
+_TOKENS_LOCK = threading.Lock()
+
+
+def _verify_id_token(token: str, audience: str) -> tuple[str, float]:
+    """The email and expiry of a Google-signed ID token for `audience`;
+    ValueError when it is not one. Replaced in tests."""
+    from google.auth.transport import requests as transport
+    from google.oauth2 import id_token
+
+    claims = id_token.verify_oauth2_token(token, transport.Request(), audience=audience, clock_skew_in_seconds=10)
+    email = claims.get("email")
+    if not email:
+        raise ValueError("the token names no account")
+    return email, float(claims["exp"])
+
+
+def _account(token: str, audience: str) -> str | None:
+    now = time.time()
+    with _TOKENS_LOCK:
+        kept = _TOKENS.get(token)
+        if kept is not None and kept[1] > now:
+            return kept[0]
+    try:
+        email, exp = _verify_id_token(token, audience)
+    except ValueError:
+        return None
+    with _TOKENS_LOCK:
+        if len(_TOKENS) > 1024:
+            for stale in [t for t, (_, e) in _TOKENS.items() if e <= now]:
+                del _TOKENS[stale]
+        _TOKENS[token] = (email, exp)
+    return email
+
+
 def _caller(request: Request) -> str | None:
-    """Who is asking — the bearer key, which is also whose share of the
-    queue the request counts against; None when the key is not one of ours."""
-    keys = _keys()
+    """Who is asking; None when the request carries nothing this service accepts."""
     header = request.headers.get("authorization", "")
     scheme, _, token = header.partition(" ")
+    token = token.strip()
+    if scheme.lower() != "bearer":
+        token = ""
+    audience = os.environ.get("GLOSSKERNELS_AUDIENCE", "").strip()
+    if audience:
+        callers = _names("GLOSSKERNELS_CALLERS")
+        if not token:
+            return None
+        email = _account(token, audience)
+        return email if email is not None and email in callers else None
+    keys = _names("GLOSSKERNELS_KEYS")
     if not keys:
         return "open"
-    return token.strip() if scheme.lower() == "bearer" and token.strip() in keys else None
+    return token if token and token in keys else None
 
 
 def _matrix(body: dict[str, Any], name: str, *, ndim: int) -> np.ndarray:
@@ -151,23 +208,31 @@ def _door(read):
     """Wrap a read: auth, body, the owner's queue, errors as JSON."""
 
     async def endpoint(request: Request) -> Response:
-        caller = _caller(request)
+        route = request.url.path
+        caller = await run_in_threadpool(_caller, request)
         if caller is None:
-            return JSONResponse({"error": "unauthorized: a bearer key this service issued"}, status_code=401)
+            telemetry.refused(401, None, route, "unauthorized")
+            return JSONResponse({"error": "unauthorized: a bearer this service accepts"}, status_code=401)
         try:
             body = await _body(request)
             args = await run_in_threadpool(read.parse, body)
             return _Answer(await read.serve(owner(), caller, **args))
         except Refusal as e:
-            return JSONResponse({"error": str(e)}, status_code=e.status)
+            refusal, status, headers = e, e.status, None
         except Busy as e:
-            return JSONResponse({"error": str(e)}, status_code=429, headers={"Retry-After": str(e.retry_after)})
+            refusal, status, headers = e, 429, {"Retry-After": str(e.retry_after)}
         except TooLarge as e:
-            return JSONResponse({"error": str(e)}, status_code=413)
+            refusal, status, headers = e, 413, None
         except ContextUnknown as e:
-            return JSONResponse({"error": str(e)}, status_code=404)
+            refusal, status, headers = e, 404, None
         except kernels.KernelError as e:
-            return JSONResponse({"error": str(e)}, status_code=422)
+            refusal, status, headers = e, 422, None
+        except Exception as e:  # a failure is a 500 with the traceback in the log, not on the wire
+            telemetry.log.error("request_failed", extra={"route": route, "caller": caller}, exc_info=e)
+            telemetry.refused(500, caller, route, type(e).__name__)
+            return JSONResponse({"error": f"the kernel failed: {type(e).__name__}"}, status_code=500)
+        telemetry.refused(status, caller, route, str(refusal))
+        return JSONResponse({"error": str(refusal)}, status_code=status, headers=headers)
 
     return endpoint
 
@@ -375,15 +440,31 @@ class Misfit:
         return {"scores": got[0], "columns": got[1]} if columns else {"scores": got}
 
 
+VERSION = os.environ.get("GLOSSKERNELS_VERSION", "") or "dev"
+
+
 async def healthz(_: Request) -> Response:
+    """Alive, and what the owner has done: `owner` carries its counters
+    and the time of its last cycle, for a probe that wants more than the port."""
     k = kernels.peek()
-    return JSONResponse({"status": "ok", "device": k.device if k else None, "loaded": k is not None})
+    own = _OWNER
+    return JSONResponse(
+        {
+            "status": "ok",
+            "version": VERSION,
+            "device": k.device if k else None,
+            "loaded": k is not None,
+            "owner": None if own is None else {**own.stats, "waiting_cells": own._cells},
+        }
+    )
 
 
-app = Starlette(
-    routes=[
-        Route("/healthz", healthz, methods=["GET"]),
-        Route("/bands", _door(Bands), methods=["POST"]),
-        Route("/misfit", _door(Misfit), methods=["POST"]),
-    ]
+app = telemetry.asgi(
+    Starlette(
+        routes=[
+            Route("/healthz", healthz, methods=["GET"]),
+            Route("/bands", _door(Bands), methods=["POST"]),
+            Route("/misfit", _door(Misfit), methods=["POST"]),
+        ]
+    )
 )
