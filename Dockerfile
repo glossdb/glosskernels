@@ -6,6 +6,9 @@
 #   docker build --build-arg VERSION=$(git rev-parse --short HEAD) -t glosskernels .
 #   docker run --gpus all -p 8100:8100 glosskernels
 #
+# Released as ghcr.io/glossdb/glosskernels:<version> at a v* tag
+# (.github/workflows/release.yml), VERSION set to pyproject's version.
+#
 # What a host sets: GLOSSKERNELS_AUDIENCE and GLOSSKERNELS_CALLERS (or
 # GLOSSKERNELS_KEYS) for the doors, OTEL_EXPORTER_OTLP_ENDPOINT for a
 # collector, the queue and cache sizes (README). Nothing here names a

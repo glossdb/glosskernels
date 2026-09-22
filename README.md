@@ -77,6 +77,16 @@ Production is GCP (`docs/deployment-design.md`); the deployment — the
 project, the region, the collector sidecar, who may call — lives in the
 private deployment repo, not here.
 
+The image is `ghcr.io/glossdb/glosskernels:<version>` (and `:latest`),
+public, built by `.github/workflows/release.yml` when a `v<version>`
+tag is pushed; Cloud Run pulls it by that name. A release: bump
+`version` in `pyproject.toml`, `git tag v<version> && git push origin
+v<version>`; the tag must match the file. Between releases a manual
+dispatch of the workflow pushes `:main` and `:sha-<commit>` — a
+deployment pins one of those; `:latest` moves at a tag only. The
+build starts the image on the runner's CPU and reads `/healthz` before
+it pushes, so a pushed image has its checkpoints and its version.
+
 What the service says about itself (`telemetry.py`): a JSON line on
 stdout per start, per owner cycle (jobs, reads, cells, callers, device
 seconds, what still waits), per refusal (status, caller, route, reason)
