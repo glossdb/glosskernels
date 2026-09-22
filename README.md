@@ -67,7 +67,11 @@ the port repo's pinned oracle fixtures. Where this is going:
 
 One container (`Dockerfile`): the same process on whatever GPU the
 host has, CPU without one; not root, the checkpoints and the commit
-baked. Every voice loads before the port opens, so the port is the
+baked. Two stages: uv makes the venv and pulls the checkpoints in the
+first, and the image is the interpreter plus those two trees — no uv,
+no cache, no source. Its size is torch and the CUDA libraries its
+wheels carry (about 3 GiB compressed), plus half a gigabyte of
+checkpoints. Every voice loads before the port opens, so the port is the
 readiness signal and a cold start is one number. On SIGTERM what is in
 flight is finished and a request on a kept connection is sent back to
 retry (`503`, `Retry-After`). A cycle that fails (an out-of-memory)

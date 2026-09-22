@@ -1,0 +1,7 @@
+# The build context is what the venv is made from: the lock and the
+# package. Nothing else — no fixtures, no tests, no .git, no caches.
+*
+!pyproject.toml
+!uv.lock
+!src
+src/**/__pycache__
