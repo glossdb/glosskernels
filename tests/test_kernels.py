@@ -89,8 +89,13 @@ def test_misfit_reproduces_the_density_oracle(k):
     logs = k.misfit(
         d["x_test"].astype(np.float64), perms=list(d["perms"]), random_state=42, train=d["x_train"].astype(np.float64)
     )
+    # A score is the product of 2 x cols conditional densities, so the
+    # estimators' float noise compounds: a CPU with another BLAS than the
+    # oracle's (x86 oneDNN against arm64 Accelerate) lands 1e-3 off in
+    # relative terms; an accelerator further.
     rtol, atol = _tol(k)
-    assert np.allclose(np.exp(logs), d["scores"], rtol=rtol * 10, atol=atol), f"{np.exp(logs)} vs {d['scores']}"
+    rtol = max(rtol * 10, 5e-3)
+    assert np.allclose(np.exp(logs), d["scores"], rtol=rtol, atol=atol), f"{np.exp(logs)} vs {d['scores']}"
     # The read the door consumes: one finite log density per row.
     assert logs.shape == (d["x_test"].shape[0],) and np.isfinite(logs).all()
 
