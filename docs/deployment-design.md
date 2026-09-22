@@ -279,7 +279,8 @@ entity scoring · synthetic twins.
       over-cover the third (96, from 87); the tenant's own record closes the rest.
 - [x] `/misfit` per column (`columns: true`): the conditionals the score sums, returned unsummed;
       `folds` to score rows from a context they are not in.
-- [ ] glossql moves to this API.
+- [x] glossql moves to this API (its `kernel-api` branch): a walk rides one
+      `/bands` request, the grid another, `/misfit` the third; answers unchanged.
 - [ ] After the move: the forecast door in glossql — a declared forecast, its
       future months and its backtest (`docs/forecast-door.md`). Shapes side by
       side waits for load.
