@@ -20,7 +20,9 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 RUN useradd --system --uid 10001 --create-home --home-dir /app kernel
 USER kernel
 WORKDIR /app
-ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy PYTHONUNBUFFERED=1 HF_HOME=/app/hf HF_HUB_OFFLINE=0
+# No uv cache: it would sit in the layer beside the venv, a second copy
+# of every unpacked wheel (the CUDA libraries are most of the image).
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_NO_CACHE=1 PYTHONUNBUFFERED=1 HF_HOME=/app/hf HF_HUB_OFFLINE=0
 COPY --chown=kernel pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project --extra auth --extra otel
 COPY --chown=kernel src ./src
