@@ -67,7 +67,11 @@ the port repo's pinned oracle fixtures. Where this is going:
 
 One container (`Dockerfile`): the same process on whatever GPU the
 host has, CPU without one; not root, the checkpoints and the commit
-baked. Every voice loads before the port opens, so the port is the
+baked. Two stages: uv makes the venv and pulls the checkpoints in the
+first, and the image is the interpreter plus those two trees — no uv,
+no cache, no source. Its size is torch and the CUDA libraries its
+wheels carry (about 3 GiB compressed), plus half a gigabyte of
+checkpoints. Every voice loads before the port opens, so the port is the
 readiness signal and a cold start is one number. On SIGTERM what is in
 flight is finished and a request on a kept connection is sent back to
 retry (`503`, `Retry-After`). A cycle that fails (an out-of-memory)
@@ -78,14 +82,18 @@ project, the region, the collector sidecar, who may call — lives in the
 private deployment repo, not here.
 
 The image is `ghcr.io/glossdb/glosskernels:<version>` (and `:latest`),
-public, built by `.github/workflows/release.yml` when a `v<version>`
-tag is pushed; Cloud Run pulls it by that name. A release: bump
-`version` in `pyproject.toml`, `git tag v<version> && git push origin
-v<version>`; the tag must match the file. Between releases a manual
-dispatch of the workflow pushes `:main` and `:sha-<commit>` — a
-deployment pins one of those; `:latest` moves at a tag only. The
-build starts the image on the runner's CPU and reads `/healthz` before
-it pushes, so a pushed image has its checkpoints and its version.
+public, from `.github/workflows/release.yml`; Cloud Run pulls it by
+that name. A manual dispatch of the workflow builds the commit and
+pushes `:main` and `:sha-<commit>` — a deployment pins that, and the
+cloud tests run against it. A release names what was tested: bump
+`version` in `pyproject.toml` (before the dispatch, so the image is
+built with it), `git tag v<version> && git push origin v<version>`;
+the tag must match the file, and a commit whose `:sha-` image is up is
+not built again — `:<version>` and `:latest` are pointed at it (a
+commit without an image is built first). Every build bakes
+`<version>+<commit>` as `GLOSSKERNELS_VERSION`, and starts the image
+on the runner's CPU to read `/healthz` before it pushes, so a pushed
+image has its checkpoints and its version. `:latest` moves at a tag only.
 
 What the service says about itself (`telemetry.py`): a JSON line on
 stdout per start, per owner cycle (jobs, reads, cells, callers, device
