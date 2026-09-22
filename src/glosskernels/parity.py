@@ -22,17 +22,27 @@ def _rel(q: np.ndarray, expect: np.ndarray) -> float:
     return float(np.max(np.abs(q - expect) / np.maximum(1.0, np.abs(expect))))
 
 
-def run(fixtures: Path, use_amp: bool = False) -> dict:
+def _spread(devs: list[float]) -> dict:
+    """Per-fit deviations: the worst says whether anything broke, the
+    median and the 99th say whether it is one fit or all of them."""
+    d = np.asarray(devs)
+    return {"max_rel_dev": float(d.max()), "p99_rel_dev": float(np.quantile(d, 0.99)), "median_rel_dev": float(np.median(d))}
+
+
+def run(fixtures: Path, use_amp: bool = False, bf16: bool = False) -> dict:
+    if bf16:  # autocast's CUDA default is float16; bfloat16 keeps float32's range
+        torch.set_autocast_dtype("cuda", torch.bfloat16)
     k = Kernels(use_amp=use_amp)
     out = {
         "device": k.device,
         "gpu": torch.cuda.get_device_name(0) if k.device == "cuda" else None,
         "amp": use_amp,
+        "autocast": ("bfloat16" if bf16 else "float16") if use_amp else None,
     }
 
     walk = np.load(fixtures / "bands_walk.npz")
     pinned = np.load(fixtures / "bands_pinned.npz")["bands"]
-    worst, flips80, flips90 = 0.0, 0, 0
+    devs, flips80, flips90 = [], 0, 0
     t = time.perf_counter()
     for i, (_g, _s, _m, _t, off, size, _id) in enumerate(walk["index"]):
         q, _pit = k.band_point(
@@ -43,7 +53,7 @@ def run(fixtures: Path, use_amp: bool = False) -> dict:
             float(walk["actual"][i]),
         )
         q = np.asarray(q)
-        worst = max(worst, _rel(q, pinned[i]))
+        devs.append(_rel(q, pinned[i]))
         a = float(walk["actual"][i])
         for lo_i, hi_i, name in ((1, 3, "80"), (0, 4, "90")):
             lo, hi = sorted((q[lo_i], q[hi_i]))
@@ -55,23 +65,43 @@ def run(fixtures: Path, use_amp: bool = False) -> dict:
                     flips90 += 1
     out["walk"] = {
         "fits": int(len(walk["index"])),
-        "max_rel_dev": worst,
+        **_spread(devs),
         "flips80": flips80,
         "flips90": flips90,
         "s": round(time.perf_counter() - t, 1),
     }
 
+    # The same walk as one call: every point prepared, grouped by shape,
+    # each group one forward pass — what `/bands` does with a walk.
+    t = time.perf_counter()
+    reads = [
+        (walk["train_x_all"][off : off + size], walk["train_y_all"][off : off + size], walk["test_x"][i][None, :])
+        for i, (_g, _s, _m, _t, off, size, _id) in enumerate(walk["index"])
+    ]
+    together = k.bands_many(reads, ALPHAS, members=1)
+    out["walk_together"] = {
+        **_spread([_rel(q[0], pinned[i]) for i, (q, _grid) in enumerate(together)]),
+        "shapes": len({r[0].shape for r in reads}),
+        "s": round(time.perf_counter() - t, 1),
+    }
+    # Again, the shapes now seen: what a warm service pays.
+    t = time.perf_counter()
+    where: dict = {}
+    k.bands_many(reads, ALPHAS, members=1, timings=where)
+    out["walk_together"]["s_warm"] = round(time.perf_counter() - t, 2)
+    out["walk_together"]["where"] = where
+
     d = np.load(fixtures / "e4_walk.npz")
     oracle = np.load(fixtures / "e4_ensemble.npz")["grid_bands"]
-    worst = 0.0
+    devs = []
     t = time.perf_counter()
     for i in range(oracle.shape[0]):
         off, size = (int(v) for v in d["grid_offsets"][i])
         q = k.band_grid(
             d["grid_train_x"][off : off + size], d["grid_train_y"][off : off + size], d["grid_test_x"][i], ALPHAS
         )
-        worst = max(worst, _rel(q, oracle[i].T))
-    out["grids"] = {"fits": int(oracle.shape[0]), "max_rel_dev": worst, "s": round(time.perf_counter() - t, 1)}
+        devs.append(_rel(q, oracle[i].T))
+    out["grids"] = {"fits": int(oracle.shape[0]), **_spread(devs), "s": round(time.perf_counter() - t, 1)}
 
     dens = np.load(fixtures / "density_scores.npz")
     logs = k.misfit(

@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from glosskernels.kernels import Kernels
+from glosskernels.kernels import KernelError, Kernels
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 ALPHAS = [0.05, 0.10, 0.50, 0.90, 0.95]
@@ -50,6 +50,23 @@ def test_band_point_reproduces_the_pinned_walk(k):
     assert flips <= (0 if k.device == "cpu" else 1)
 
 
+def test_the_walk_in_one_call_matches_the_pinned_bands(k):
+    """Points grouped by shape and answered a group a forward pass —
+    batching must not move a band."""
+    walk = np.load(FIXTURES / "bands_walk.npz")
+    pinned = np.load(FIXTURES / "bands_pinned.npz")["bands"]
+    n = int(os.environ.get("GLOSSKERNELS_TEST_FITS", "40"))
+    rtol, atol = _tol(k)
+    reads = [
+        (walk["train_x_all"][off : off + size], walk["train_y_all"][off : off + size], walk["test_x"][i][None, :])
+        for i, (_g, _s, _m, _t, off, size, _id) in enumerate(walk["index"][:n])
+    ]
+    for i, (q, grid) in enumerate(k.bands_many(reads, ALPHAS, members=1)):
+        scale = max(1.0, float(np.abs(pinned[i]).max()))
+        assert np.allclose(q[0], pinned[i], rtol=rtol, atol=atol * scale), f"fit {i}: {q[0]} vs {pinned[i]}"
+        assert grid.shape[0] == 1 and np.all(np.diff(grid[0]) >= 0)
+
+
 def test_band_grid_reproduces_the_ensemble_oracle(k):
     d = np.load(FIXTURES / "e4_walk.npz")
     oracle = np.load(FIXTURES / "e4_ensemble.npz")["grid_bands"]  # (fits, alphas, rows)
@@ -85,3 +102,22 @@ def test_self_fit_misfit_ranks_an_outlier_last(k):
     x[7] = [6.0, -6.0, 6.0, -6.0]
     logs = k.misfit(x)
     assert int(np.argmin(logs)) == 7
+
+
+def test_misfit_columns_sum_to_the_score_and_name_the_cell(k):
+    rng = np.random.default_rng(3)
+    x = rng.normal(size=(60, 4))
+    x[:, 1] = 0.8 * x[:, 0] + 0.2 * x[:, 1]
+    x[7, 2] = 9.0  # one cell off; the rest of the row ordinary
+    logs, shares = k.misfit(x, columns=True)
+    assert shares.shape == x.shape
+    assert np.array_equal(logs, k.misfit(x))  # asking per column changes no score
+    assert np.allclose(shares.sum(axis=1), logs, rtol=1e-6, atol=1e-6)
+    assert int(np.argmin(shares[7])) == 2
+    # Scored from a context it is not in, the cell is the frame's least likely.
+    held, held_shares = k.misfit(x, columns=True, folds=2)
+    assert np.allclose(held_shares.sum(axis=1), held, rtol=1e-6, atol=1e-6)
+    assert int(np.argmin(held)) == 7
+    assert np.unravel_index(np.argmin(held_shares), held_shares.shape) == (7, 2)
+    with pytest.raises(KernelError, match="folds"):
+        k.misfit(x[:3], folds=2)
