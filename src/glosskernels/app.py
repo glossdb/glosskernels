@@ -47,8 +47,16 @@ from .owner import Busy, Owner, TooLarge
 _OWNER: Owner | None = None
 _OWNER_LOCK = threading.Lock()
 
-# A body is parsed before the queue can refuse it, so it is bounded first.
-MAX_BODY_MB = int(os.environ.get("GLOSSKERNELS_MAX_BODY_MB", "") or 256)
+# A body is parsed before the queue can refuse it, so it is bounded first —
+# and tightly: JSON numbers become Python objects several times their text
+# before they are an array. glossql's largest request is under a megabyte.
+MAX_BODY_MB = int(os.environ.get("GLOSSKERNELS_MAX_BODY_MB", "") or 32)
+
+
+# Set when the host has asked the process to stop: what is in flight is
+# finished, and a request arriving on a kept connection is sent back to
+# retry (a 503 with `Retry-After`) — the host has already moved traffic.
+DRAINING = threading.Event()
 
 
 def owner() -> Owner:
@@ -209,6 +217,9 @@ def _door(read):
 
     async def endpoint(request: Request) -> Response:
         route = request.url.path
+        if DRAINING.is_set():
+            telemetry.refused(503, None, route, "draining")
+            return JSONResponse({"error": "this instance is stopping — retry"}, status_code=503, headers={"Retry-After": "2"})
         caller = await run_in_threadpool(_caller, request)
         if caller is None:
             telemetry.refused(401, None, route, "unauthorized")

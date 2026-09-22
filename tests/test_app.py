@@ -2,6 +2,7 @@
 
 import json
 import os
+import threading
 import time
 
 import httpx
@@ -171,6 +172,14 @@ def test_a_failure_is_a_500_as_json_and_a_log_line(client, monkeypatch, capsys):
     assert failed["severity"] == "ERROR" and failed["route"] == "/misfit" and "ZeroDivisionError" in failed["traceback"]
     refused = next(line for line in lines if line["event"] == "refused")
     assert refused["status"] == 500 and refused["caller"] == "open"
+
+
+def test_a_draining_instance_sends_requests_back_to_retry(client, monkeypatch):
+    monkeypatch.setattr(app_module, "DRAINING", threading.Event())
+    app_module.DRAINING.set()
+    r = client.post("/misfit", json={"x": [[1, 2], [3, 4]]})
+    assert r.status_code == 503 and r.headers["retry-after"] == "2" and "retry" in r.json()["error"]
+    assert client.get("/healthz").status_code == 200
 
 
 def test_healthz(client):

@@ -166,19 +166,24 @@ class Owner:
                 jobs = self._take()
             started = time.perf_counter()
             kind = jobs[0].kind
+            failed = False
             try:
                 with telemetry.span("owner.cycle", kind=kind, jobs=len(jobs)):
                     self._serve(jobs)
             except BaseException as e:  # the owner must outlive any one cycle
+                failed = True
                 for job in jobs:
                     if not job.future.done():
                         job.future.set_exception(e)
                 self.stats["failed"] += 1
                 telemetry.failed(kind, len(jobs), e)
+                del e  # its traceback holds the pass's tensors
+                self._recover()
             seconds = time.perf_counter() - started
             cells = sum(job.cells for job in jobs)
-            rate = cells / max(seconds, 1e-6)
-            self._rate = rate if self._rate == 0 else 0.8 * self._rate + 0.2 * rate
+            if not failed:  # a failed cycle says nothing about the rate
+                rate = cells / max(seconds, 1e-6)
+                self._rate = rate if self._rate == 0 else 0.8 * self._rate + 0.2 * rate
             self.stats["cycles"] += 1
             self.stats["jobs"] += len(jobs)
             self.stats["largest_cycle_jobs"] = max(self.stats["largest_cycle_jobs"], len(jobs))
@@ -192,6 +197,14 @@ class Owner:
                 seconds=seconds,
                 waiting_cells=self._cells,
             )
+
+    def _recover(self) -> None:
+        try:
+            recover = getattr(self._kernels_get(), "recover", None)
+            if recover is not None:
+                recover()
+        except Exception as e:  # noqa: BLE001 — recovery failing is logged, never fatal
+            telemetry.log.error("recover_failed", extra={"error": f"{type(e).__name__}: {e}"})
 
     def _serve(self, jobs: list[_Job]) -> None:
         kernel = self._kernels_get()

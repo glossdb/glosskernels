@@ -329,11 +329,11 @@ entity scoring · synthetic twins.
       Dockerfile, the Cloud Run service scaled to zero with the collector
       sidecar, IAM and ingress; then measure the cold start end to end and
       the first real walk's cost.
-- [ ] Still owed by the service: a failed cycle frees the device
-      (`torch.cuda.empty_cache`) before the next; a smaller body cap (256
-      MB of JSON parses to several GB of objects); SIGTERM drains the queue
-      before the port closes; Chronos-2 loaded at start rather than on the
-      first voices read, so a cold start pays everything once.
+- [x] A failed cycle hands the device's memory back and does not feed the
+      rate; the body cap is 32 MB (JSON parses to several times its text);
+      SIGTERM finishes what is in flight and sends new requests back to
+      retry; every voice loads at start, so a cold start is one number.
+      glossql still owes a retry on a reset connection or a `503`.
 - [ ] After the move: the forecast door in glossql — a declared forecast, its
       future months and its backtest (`docs/forecast-door.md`). Shapes side by
       side waits for load.

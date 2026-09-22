@@ -24,7 +24,8 @@ GLOSSKERNELS_KEYS=k1 uv run glosskernels   # a bearer per caller
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | a collector to send traces, metrics and logs to (OTLP/HTTP); unset, the JSON log lines on stdout are all; the `otel` extra |
 | `GLOSSKERNELS_QUEUE_MB` | what may wait for the GPU, in MB of reads; default 512, half of it at most one caller's — past it a `429` with `Retry-After` |
 | `GLOSSKERNELS_CACHE_MB` | device memory for kept contexts; default two fifths of the GPU (2 GB without one), half of it at most one caller's |
-| `GLOSSKERNELS_MAX_BODY_MB` | the largest body parsed; default 256 — past it a `413` |
+| `GLOSSKERNELS_MAX_BODY_MB` | the largest body parsed; default 32 (glossql's largest request is under one) — past it a `413` |
+| `GLOSSKERNELS_PRELOAD` | `0` leaves Chronos-2 to its first read; default every voice loads before the port opens |
 | `GLOSSKERNELS_PREPARE_WORKERS` | processes preparing reads beside the model; default the cores but one, at most 8 |
 | `HF_HUB_OFFLINE` | `1` in the image: the checkpoint is baked, nothing is fetched at start |
 
@@ -66,7 +67,12 @@ the port repo's pinned oracle fixtures. Where this is going:
 
 One container (`Dockerfile`): the same process on whatever GPU the
 host has, CPU without one; not root, the checkpoints and the commit
-baked, SIGTERM reaching the process. Nothing in it names a provider.
+baked. Every voice loads before the port opens, so the port is the
+readiness signal and a cold start is one number. On SIGTERM what is in
+flight is finished and a request on a kept connection is sent back to
+retry (`503`, `Retry-After`). A cycle that fails (an out-of-memory)
+fails its own callers, hands the device's memory back and leaves the
+rate estimate alone. Nothing in it names a provider.
 Production is GCP (`docs/deployment-design.md`); the deployment — the
 project, the region, the collector sidecar, who may call — lives in the
 private deployment repo, not here.
