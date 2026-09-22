@@ -241,12 +241,51 @@ the same number without the flush (8 tables: 46 → 36 ms).
 | 20k-row context, cached: build → query | 10.6 → 0.33 s | 5.1 → 0.15 s | 1.9 → 0.08 s |
 | 100k-row context, cached | OOM | OOM | 16 → 0.11 s (18.8 GB) |
 
-**Production is GCP, on the L4** (G2 machines; Cloud Run with GPU or GKE).
-GCP has no L40S: the later large-memory tier there is an A100 or an RTX
-PRO 6000-class card.
-A cold container answers after 6–11 s of checkpoint load; keep one warm.
-The container is plain (the `Dockerfile`), with no provider's API in it;
-more than one instance routes by context id, and a miss is only a rebuild.
+**Production is GCP, on the L4** (Cloud Run with a GPU; GKE if Cloud Run's
+tier falls short). GCP has no L40S: the later large-memory tier there is
+an A100 or an RTX PRO 6000-class card. The container is plain (the
+`Dockerfile`), with no provider's API in it — it runs on any host with a
+GPU for a measurement — and the deployment itself (project, region,
+collector, who may call) lives in the private deployment repo.
+
+- **Scaled to zero, not kept warm.** A warm L4 around the clock is the
+  price of an L4-hour around the clock, for a service whose day is a
+  handful of walks. A GPU service on Cloud Run is billed by instance
+  time (start to scale-down after idle), never by request, so a walk
+  costs the minutes its instance lives, not a day; the price is the cold
+  start, which the caller waits out (glossql's call timeout is 600 s).
+  The model loads before the port opens, so the port is the readiness
+  signal, and the checkpoint load is 6–11 s; the image pull in front of
+  it is the number to measure on the first deploy.
+- **CUDA from the wheels, the driver from the host.** The image has no
+  CUDA base: torch's wheels carry the runtime libraries (CUDA 13.0 in the
+  lock), and Cloud Run mounts its driver (580, CUDA 13.0) into the
+  container. A lock that moves torch past the driver's CUDA needs a
+  forward-compatibility package or a driver bump — check on every torch
+  move. Free-threaded Python, when shapes side by side is taken up, is
+  `uv python install 3.14t` in the same image (torch ships cp314t Linux
+  wheels), not another base.
+- **One instance.** `max-instances 1` until 429s say otherwise: a second
+  instance halves cache hits, since Cloud Run does not route by context
+  id. Container concurrency stays high; the service's own queue pushes
+  back, so nothing queues in front of it. The request timeout is set to
+  what the caller waits.
+- **Authenticated by identity, not by key.** The service requires
+  authentication at the Cloud Run edge (its invoker role held by
+  glossql's service account) and ingress from the project's network
+  only; glossql mints an ID token for the service's URL from its
+  metadata server and sends it as the bearer. The service verifies the
+  same token itself (`GLOSSKERNELS_AUDIENCE`, `GLOSSKERNELS_CALLERS`), so
+  a service left open by mistake still refuses, and knows the caller —
+  whose share of the queue the request counts against.
+- **Observed through the collector.** A JSON line per cycle, refusal
+  and failure on stdout, which Cloud Logging keeps; with the OpenTelemetry
+  collector sidecar named as `OTEL_EXPORTER_OTLP_ENDPOINT`, the same as
+  spans and metrics in Cloud Trace and Cloud Monitoring beside Cloud Run's
+  own request metrics. The alerts that matter: any 5xx; the 429 rate
+  rising (the queue is full — capacity, not a fault); `/bands` latency past
+  what a walk expects; a failed cycle. Plus an uptime check on `/healthz`
+  and a budget alert.
 
 ## Later, once there is load
 
@@ -281,6 +320,20 @@ entity scoring · synthetic twins.
       `folds` to score rows from a context they are not in.
 - [x] glossql moves to this API (its `kernel-api` branch): a walk rides one
       `/bands` request, the grid another, `/misfit` the third; answers unchanged.
+- [x] Production readiness of the image and the process: ID-token auth,
+      JSON logs and OpenTelemetry, a `/healthz` with the owner's counters,
+      failures as JSON 500s, non-root, SIGTERM to the process, the commit
+      baked, tests in CI. Modal removed; the bench is `python -m
+      glosskernels.measure` on any GPU host.
+- [ ] The first deploy (the deployment repo): Cloud Build from the
+      Dockerfile, the Cloud Run service scaled to zero with the collector
+      sidecar, IAM and ingress; then measure the cold start end to end and
+      the first real walk's cost.
+- [x] A failed cycle hands the device's memory back and does not feed the
+      rate; the body cap is 32 MB (JSON parses to several times its text);
+      SIGTERM finishes what is in flight and sends new requests back to
+      retry; every voice loads at start, so a cold start is one number.
+      glossql still owes a retry on a reset connection or a `503`.
 - [ ] After the move: the forecast door in glossql — a declared forecast, its
       future months and its backtest (`docs/forecast-door.md`). Shapes side by
       side waits for load.

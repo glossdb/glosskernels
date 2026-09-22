@@ -2,6 +2,7 @@
 before memory is."""
 
 import threading
+import time
 
 import numpy as np
 import pytest
@@ -106,3 +107,35 @@ def test_the_queue_pushes_back_before_memory_does():
         own.bands("b", [read(1.0, rows=40_000)], [0.5], 1)
     assert own.stats["refused_busy"] == 1
     kernel.gate.set()
+
+
+def test_a_failed_cycle_recovers_the_device_and_leaves_the_rate_alone():
+    """A pass that dies fails its callers, has the kernel hand its memory
+    back, and does not teach the rate estimator anything."""
+
+    class Dying:
+        def __init__(self):
+            self.recovered = 0
+            self.die = True
+
+        def answer(self, reads, alphas, members):
+            if self.die:
+                raise RuntimeError("CUDA out of memory")
+            return [Answered({"tabicl": (np.zeros((1, len(a))), np.zeros((1, 3)))}) for a in alphas]
+
+        def recover(self):
+            self.recovered += 1
+
+    kernel = Dying()
+    own = Owner(lambda: kernel)
+    with pytest.raises(RuntimeError, match="out of memory"):
+        own.bands("a", [read(1.0)], [0.5], 1).result(5)
+    # The callers hear first; the recovery follows once the traceback is dropped.
+    for _ in range(100):
+        if kernel.recovered:
+            break
+        time.sleep(0.01)
+    assert kernel.recovered == 1 and own.stats["failed"] == 1 and own._rate == 0.0
+    kernel.die = False
+    assert len(own.bands("a", [read(2.0)], [0.5], 1).result(5)) == 1
+    assert own.stats["cycles"] == 2 and own._rate > 0

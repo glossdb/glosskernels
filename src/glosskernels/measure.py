@@ -1,7 +1,12 @@
 """Timings at the reads' real shapes, on whatever device this process
-has: what one call costs, and what a panel at cube scale costs. Run
-locally with `python -m glosskernels.measure`; Modal's entrypoint
-calls `run` on the GPU (modal_app.py).
+has: what one call costs, and what a panel at cube scale costs. The
+bench for any host with a GPU that runs the container:
+
+    python -m glosskernels.measure                      # the reads' timings
+    python -m glosskernels.measure --context-rows 5000,20000,100000
+    python -m glosskernels.measure --parity fixtures/   # the pinned oracle on this device
+    python -m glosskernels.measure --batching           # small reads riding one pass, callers, voices
+    python -m glosskernels.measure --kept               # the context cache, fp16 against fp32
 
 With `context_rows` the run adds the two questions a shared instance
 turns on: what a cached context costs to build, hold and query against
@@ -380,17 +385,41 @@ def _rows(named: str | None) -> list[int] | None:
     return [int(r) for r in named.split(",") if r.strip()] if named else None
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> None:
+    import argparse
     import os
+    from pathlib import Path
 
-    workers = os.environ.get("GLOSSKERNELS_MISFIT_WORKERS")
-    print(
-        json.dumps(
-            run(
-                use_amp=os.environ.get("GLOSSKERNELS_AMP") == "1",
-                misfit_workers=int(workers) if workers else None,
-                context_rows=_rows(os.environ.get("GLOSSKERNELS_CONTEXT_ROWS")),
-            ),
-            indent=1,
+    ap = argparse.ArgumentParser(prog="python -m glosskernels.measure", description=__doc__.split("\n\n")[0])
+    ap.add_argument("--amp", action="store_true", help="reduced precision (autocast)")
+    ap.add_argument("--bf16", action="store_true", help="with --parity: bfloat16 under autocast")
+    ap.add_argument("--misfit-workers", type=int, default=0)
+    ap.add_argument("--context-rows", default="", help="e.g. 5000,20000: cached contexts and concurrent callers")
+    ap.add_argument("--flushing-probe", action="store_true", help="keep the package's own memory probe")
+    ap.add_argument("--parity", metavar="FIXTURES", help="the pinned-oracle parity numbers on this device")
+    ap.add_argument("--batching", action="store_true")
+    ap.add_argument("--kept", action="store_true")
+    args = ap.parse_args(argv)
+    os.environ["GLOSSKERNELS_FLUSHING_PROBE"] = "1" if args.flushing_probe else ""
+    if args.parity:
+        from .parity import run as parity
+
+        print(json.dumps(parity(Path(args.parity), use_amp=args.amp, bf16=args.bf16), indent=1))
+    elif args.batching:
+        k = Kernels(use_amp=args.amp)
+        for row in [*batching(k), callers(k), spoken(k)]:
+            print(json.dumps(row))
+    elif args.kept:
+        for row in kept(Kernels()):
+            print(json.dumps(row))
+    else:
+        print(
+            json.dumps(
+                run(use_amp=args.amp, misfit_workers=args.misfit_workers or None, context_rows=_rows(args.context_rows)),
+                indent=1,
+            )
         )
-    )
+
+
+if __name__ == "__main__":
+    main()

@@ -19,11 +19,21 @@ dependencies = [
     "chronos-forecasting>=2",
 ]
 
+[project.optional-dependencies]
+# ID tokens verified in-process (GLOSSKERNELS_AUDIENCE); Google's certificates over HTTPS.
+auth = ["google-auth>=2.30", "requests>=2.32"]
+# Traces, metrics and logs over OTLP/HTTP to a collector (OTEL_EXPORTER_OTLP_ENDPOINT).
+otel = [
+    "opentelemetry-sdk>=1.30",
+    "opentelemetry-exporter-otlp-proto-http>=1.30",
+    "opentelemetry-instrumentation-asgi>=0.51b0",
+]
+
 [project.scripts]
 glosskernels = "glosskernels.__main__:main"
 
 [dependency-groups]
-dev = ["pytest>=9", "httpx>=0.28", "modal>=1.5"]
+dev = ["pytest>=9", "httpx>=0.28"]
 harness = [
     "pandas>=2.2",
     "pyarrow>=17",

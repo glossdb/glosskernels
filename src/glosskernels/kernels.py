@@ -169,7 +169,20 @@ class Kernels:
         loader.model_.to(loader.device_)
         self.model = loader.model_
         self.contexts = Contexts(budget_bytes(self.device))
-        self.chronos = voices.Chronos2(self.device)  # loads on first use
+        self.chronos = voices.Chronos2(self.device)  # loads on first use, or at start (`load_voices`)
+
+    def load_voices(self) -> None:
+        """Every voice's weights on the device now, so a start pays all of
+        its load at once and the port opening means the whole service."""
+        self.chronos.pipeline()
+
+    def recover(self) -> None:
+        """After a failed pass: hand the allocator's reserved memory back,
+        so the next cycle does not start in the failed one's fragments."""
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
+        elif self.device == "mps":
+            torch.mps.empty_cache()
 
     def _regressor(self, **kwargs: Any) -> _Regressor:
         kwargs.setdefault("use_amp", self.use_amp)
