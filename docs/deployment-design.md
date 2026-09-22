@@ -325,9 +325,10 @@ entity scoring · synthetic twins.
       failures as JSON 500s, non-root, SIGTERM to the process, the commit
       baked, tests in CI. Modal removed; the bench is `python -m
       glosskernels.measure` on any GPU host.
-- [x] The image from the repo: `ghcr.io/glossdb/glosskernels:<version>`
-      at a `v*` tag, `:sha-<commit>` from a dispatch, the version baked;
-      started on the runner and asked `/healthz` before it is pushed.
+- [x] The image from the repo: `ghcr.io/glossdb/glosskernels:sha-<commit>`
+      from a dispatch, `<version>+<commit>` baked, started on the runner
+      and asked `/healthz` before it is pushed; a `v*` tag names that
+      image `:<version>` — what was deployed and tested is what is released.
 - [ ] The first deploy (the deployment repo): the Cloud Run service from
       that image, scaled to zero with the collector sidecar, IAM and
       ingress; then measure the cold start end to end and the first real
